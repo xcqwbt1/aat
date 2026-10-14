@@ -36,16 +36,25 @@ BOT_USERNAME = 'ATF_AIRDROP_bot'
 WEBAPP_BASE = 'https://atfminers.asloni.online/miner/index.html'
 SCREENSHOT_DIR = 'screenshots'
 
-# --- زمان‌بندی نامنظم ---
+# --- زمان‌بندی: تقریباً هر ساعت ---
 STATE_FILE = 'schedule_state.json'
-MIN_GAP_MIN = 120   # حداقل فاصله بین اجراها (دقیقه) = ۲ ساعت
-MAX_GAP_MIN = 165   # حداکثر فاصله (دقیقه) = ۲ ساعت و ۴۵ دقیقه (حاشیه‌ی ایمنی تا ۳ ساعت)
+MIN_GAP_MIN = 55    # حداقل فاصله بین اجراها (دقیقه)
+MAX_GAP_MIN = 65    # حداکثر فاصله (دقیقه)
+
+# فاصله‌ی تلاش مجدد بعد از شکست (دقیقه)
+RETRY_GAP_MIN = (20, 40)
+
+# --- صفحه‌ی اول (Mine) ---
+COIN_TAPS = (8, 15)           # تعداد تپ روی دایره‌ی ATF در هر اجرا
+COIN_TAP_DELAY = (0.3, 1.2)   # فاصله‌ی بین تپ‌ها (ثانیه)
+CLAIM_CLICKS = (3, 5)         # تعداد کلیک روی CLAIM صفحه‌ی اول در هر اجرا
+CLAIM_CLICK_DELAY = (2, 5)    # فاصله‌ی بین کلیک‌های CLAIM (ثانیه)
 
 # --- رفتار نامنظم داخل اپ ---
 START_JITTER = (0, 90)        # تاخیر رندم قبل از شروع (ثانیه)
 WANDER_CHANCE = 0.30          # احتمال سر زدن به یه تب اضافه
 EXTRA_PAUSE_CHANCE = 0.15     # احتمال مکث اضافه بین کارها
-FINAL_MINE_CLAIM_CHANCE = 0.5 # احتمال Claim نهایی Mine (وقتی اول Mine رو زده)
+FINAL_MINE_CLAIM_CHANCE = 1.0 # احتمال Mine نهایی بعد از Tasks (وقتی اول Mine رو زده)
 WANDER_TABS = ['Miners', 'Friends', 'Profile']
 
 # صبر بعد از Go تا دکمه‌ی Claim تسک فعال بشه (ثانیه، بازه‌ی تصادفی)
@@ -62,7 +71,13 @@ API_ID = int(API_ID_RAW)
 # ساخت کلاینت: اگه StringSession داریم از اون، وگرنه از فایل
 if SESSION_STRING:
     logger.info(f"🔑 استفاده از StringSession (طول: {len(SESSION_STRING)})")
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    try:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    except Exception as e:
+        raise SystemExit(
+            f"❌ مقدار TELEGRAM_SESSION خراب یا ناقصه ({type(e).__name__}). "
+            "دوباره StringSession بساز و کامل (بدون فاصله/خط اضافه) توی secret بذار."
+        )
 else:
     logger.info("📁 TELEGRAM_SESSION خالیه، استفاده از فایل session")
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -80,22 +95,32 @@ def load_next_run():
         return None
 
 
-def schedule_next_run():
-    """انتخاب فاصله‌ی رندم و ذخیره‌ی زمان اجرای بعدی"""
-    gap = random.randint(MIN_GAP_MIN, MAX_GAP_MIN)
+def save_next_run(gap, reason):
+    """ذخیره‌ی زمان اجرای بعدی بعد از gap دقیقه"""
     next_run = datetime.now(TIMEZONE) + timedelta(minutes=gap)
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump({
                 'next_run': next_run.isoformat(),
                 'gap_minutes': gap,
+                'reason': reason,
             }, f, indent=2)
     except Exception as e:
         logger.warning(f"⚠️ ذخیره‌ی زمان‌بندی ناموفق: {e}")
     logger.info(
-        f"📅 اجرای بعدی: {next_run.strftime('%Y-%m-%d %H:%M')} تهران "
+        f"📅 اجرای بعدی ({reason}): {next_run.strftime('%Y-%m-%d %H:%M')} تهران "
         f"(بعد از {gap // 60} ساعت و {gap % 60} دقیقه)"
     )
+
+
+def schedule_next_run():
+    """بعد از اجرای موفق: تقریباً یک ساعت بعد"""
+    save_next_run(random.randint(MIN_GAP_MIN, MAX_GAP_MIN), 'success')
+
+
+def schedule_retry():
+    """بعد از شکست: تلاش مجدد با فاصله‌ی کوتاه‌تر (ولی نه هر ۱۰ دقیقه)"""
+    save_next_run(random.randint(*RETRY_GAP_MIN), 'retry')
 
 
 def is_due():
@@ -185,7 +210,7 @@ async def click_text(page, text, exact=True, timeout=15000):
     try:
         locator = page.get_by_text(text, exact=exact).first
         await locator.wait_for(state='visible', timeout=timeout)
-        await locator.click()
+        await locator.click(timeout=timeout)
         logger.info(f"✅ کلیک شد: {text}")
         return True
     except Exception as e:
@@ -235,6 +260,111 @@ async def click_visible(page, text, randomize=False):
     except Exception as e:
         logger.warning(f"⚠️ کلیک '{text}' ناموفق: {type(e).__name__}")
     return False
+
+
+# ---------- صفحه‌ی اول: دایره‌ی ATF و CLAIM ----------
+
+async def find_coin_center(page):
+    """پیدا کردن مرکز دایره‌ی ATF (المان تقریباً مربعی و بزرگ نزدیک مرکز صفحه)"""
+    vp = page.viewport_size or {'width': 412, 'height': 915}
+    vw, vh = vp['width'], vp['height']
+    try:
+        candidates = await page.evaluate(
+            """() => {
+                const out = [];
+                for (const el of document.querySelectorAll('img,canvas,svg,div')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 150 || r.width > 360) continue;
+                    if (r.height < 150 || r.height > 360) continue;
+                    const ratio = r.width / r.height;
+                    if (ratio < 0.85 || ratio > 1.15) continue;
+                    if (r.bottom < 0 || r.top > window.innerHeight) continue;
+                    out.push({
+                        x: r.x + r.width / 2,
+                        y: r.y + r.height / 2,
+                        w: r.width,
+                        tag: el.tagName,
+                    });
+                }
+                return out;
+            }"""
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ جستجوی دایره ناموفق: {type(e).__name__}")
+        candidates = []
+
+    # فقط اونایی که تقریباً وسط افقی صفحه و توی بخش میانی عمودی هستن
+    good = [
+        c for c in candidates
+        if abs(c['x'] - vw / 2) < vw * 0.15 and vh * 0.30 < c['y'] < vh * 0.80
+    ]
+    if good:
+        # اولویت با img و canvas، بعد نزدیک‌ترین به مرکز افقی
+        good.sort(key=lambda c: (c['tag'] not in ('IMG', 'CANVAS'), abs(c['x'] - vw / 2)))
+        c = good[0]
+        logger.info(f"🪙 دایره پیدا شد ({c['tag']}, عرض {c['w']:.0f}) در ({c['x']:.0f}, {c['y']:.0f})")
+        return c['x'], c['y'], min(c['w'], 300)
+
+    # روش جایگزین: نقطه‌ی تقریبی وسط صفحه
+    fx, fy = vw * 0.5, vh * 0.52
+    logger.warning(f"⚠️ دایره پیدا نشد، استفاده از نقطه‌ی تقریبی ({fx:.0f}, {fy:.0f})")
+    return fx, fy, 200
+
+
+async def tap_coin(page, action_log):
+    """چند بار تپ روی دایره‌ی ATF"""
+    x, y, size = await find_coin_center(page)
+    taps = random.randint(*COIN_TAPS)
+    spread = max(10, size * 0.12)
+    logger.info(f"👆 شروع {taps} تپ روی دایره‌ی ATF")
+
+    done = 0
+    for i in range(taps):
+        tx = x + random.uniform(-spread, spread)
+        ty = y + random.uniform(-spread, spread)
+        try:
+            await page.touchscreen.tap(tx, ty)
+        except Exception:
+            try:
+                await page.mouse.click(tx, ty)
+            except Exception as e:
+                logger.warning(f"⚠️ تپ {i+1} ناموفق: {type(e).__name__}")
+                continue
+        done += 1
+        await asyncio.sleep(random.uniform(*COIN_TAP_DELAY))
+
+    logger.info(f"🎯 تعداد تپ انجام‌شده روی دایره: {done} از {taps}")
+    action_log.append({
+        'action': 'COIN_TAPS',
+        'time': datetime.now().isoformat(),
+        'count': done,
+        'success': done > 0,
+    })
+    await random_delay(1, 3)
+    await save_shot(page, '02a_coin_taps')
+    return done
+
+
+async def multi_claim(page, action_log):
+    """چند بار کلیک روی CLAIM صفحه‌ی اول"""
+    clicks = random.randint(*CLAIM_CLICKS)
+    logger.info(f"🟡 شروع {clicks} کلیک روی CLAIM صفحه‌ی اول")
+
+    done = 0
+    for i in range(clicks):
+        ok = await click_text(page, 'CLAIM', timeout=5000)
+        if ok:
+            done += 1
+        await random_delay(*CLAIM_CLICK_DELAY)
+
+    logger.info(f"🎯 تعداد کلیک CLAIM: {done} از {clicks}")
+    action_log.append({
+        'action': 'MINE_CLAIMS',
+        'time': datetime.now().isoformat(),
+        'count': done,
+        'success': done > 0,
+    })
+    return done
 
 
 async def claim_ready_tasks(page, action_log):
@@ -301,19 +431,14 @@ async def process_go_tasks(context, page, action_log):
         await save_shot(page, f'06_go{i+1}_after_claim')
 
 
-async def do_mine_claim(page, action_log, label):
-    """رفتن به تب Mine و کلیک روی CLAIM اصلی"""
+async def do_mine_page(page, action_log, label):
+    """رفتن به تب Mine، چند تپ روی دایره‌ی ATF و چند کلیک روی CLAIM"""
     await click_text(page, 'Mine')
     await random_delay(2, 4)
-    ok = await click_text(page, 'CLAIM')
-    action_log.append({
-        'action': label,
-        'time': datetime.now().isoformat(),
-        'success': ok,
-    })
-    await random_delay(3, 6)
+    await tap_coin(page, action_log)
+    await multi_claim(page, action_log)
+    await random_delay(2, 4)
     await save_shot(page, f'02_{label.lower()}')
-    return ok
 
 
 async def do_tasks(context, page, action_log):
@@ -348,7 +473,7 @@ async def maybe_wander(page, action_log):
 
 
 async def run_miner(url, action_log):
-    """باز کردن وب‌اپ با مرورگر و انجام Claim و Tasks (با ترتیب رندم)"""
+    """باز کردن وب‌اپ با مرورگر و انجام Mine و Tasks (با ترتیب رندم)"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -372,15 +497,15 @@ async def run_miner(url, action_log):
             logger.info(f"🎲 ترتیب این اجرا: {'Mine ← Tasks' if mine_first else 'Tasks ← Mine'}")
 
             if mine_first:
-                await do_mine_claim(page, action_log, 'CLAIM')
+                await do_mine_page(page, action_log, 'MINE_1')
                 await maybe_wander(page, action_log)
                 await do_tasks(context, page, action_log)
                 if random.random() < FINAL_MINE_CLAIM_CHANCE:
-                    await do_mine_claim(page, action_log, 'FINAL_CLAIM')
+                    await do_mine_page(page, action_log, 'MINE_2')
             else:
                 await do_tasks(context, page, action_log)
                 await maybe_wander(page, action_log)
-                await do_mine_claim(page, action_log, 'CLAIM')
+                await do_mine_page(page, action_log, 'MINE_1')
 
             await save_shot(page, '07_final')
 
@@ -400,6 +525,7 @@ async def run_bot():
         return
 
     action_log = []
+    success = False
 
     try:
         await client.connect()
@@ -426,9 +552,7 @@ async def run_bot():
         await run_miner(webapp_url, action_log)
 
         logger.info("✅ چرخه کامل انجام شد")
-
-        # فقط بعد از اجرای موفق، زمان اجرای بعدی رو رندم تعیین کن
-        schedule_next_run()
+        success = True
 
     except SessionPasswordNeededError:
         logger.error("❌ نیاز به رمز عبور دو مرحله‌ای!")
@@ -437,6 +561,12 @@ async def run_bot():
         logger.error(f"❌ خطای کلی: {type(e).__name__}: {e}")
 
     finally:
+        # همیشه یه زمان بعدی ذخیره کن تا فایل وضعیت ساخته بشه و تلاش پشت‌سرهم نشه
+        if success:
+            schedule_next_run()
+        else:
+            schedule_retry()
+
         try:
             with open('action_log.json', 'w') as f:
                 json.dump(action_log, f, indent=2)
