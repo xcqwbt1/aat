@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import random
@@ -34,6 +35,7 @@ FORCE_RUN = os.getenv('FORCE_RUN', 'false').strip().lower() == 'true'
 
 BOT_USERNAME = 'ATF_AIRDROP_bot'
 WEBAPP_BASE = 'https://atfminers.asloni.online/miner/index.html'
+APP_HOST = 'atfminers.asloni.online'
 SCREENSHOT_DIR = 'screenshots'
 
 # --- زمان‌بندی: تقریباً هر ساعت ---
@@ -43,6 +45,10 @@ MAX_GAP_MIN = 65    # حداکثر فاصله (دقیقه)
 
 # فاصله‌ی تلاش مجدد بعد از شکست (دقیقه)
 RETRY_GAP_MIN = (20, 40)
+
+# --- آنلاین شدن اپ ---
+ONLINE_WAIT_MAX = 180         # حداکثر صبر برای ظاهر شدن ONLINE (ثانیه)
+WARMUP_TABS = ['Miners', 'Friends', 'Profile']  # تب‌هایی که توی گشت اولیه می‌گرده
 
 # --- صفحه‌ی اول (Mine) ---
 COIN_TAPS = (8, 15)           # تعداد تپ روی دایره‌ی ATF در هر اجرا
@@ -205,17 +211,105 @@ async def save_shot(page, name):
         logger.warning(f"⚠️ اسکرین‌شات ذخیره نشد: {e}")
 
 
-async def click_text(page, text, exact=True, timeout=15000):
-    """کلیک روی المانی که متنش مطابقه"""
+# ---------- کلیک مطمئن ----------
+
+async def robust_click(locator, label=''):
+    """کلیک با سه روش پشت‌سرهم: عادی، با مختصات، dispatch_event"""
     try:
-        locator = page.get_by_text(text, exact=exact).first
-        await locator.wait_for(state='visible', timeout=timeout)
-        await locator.click(timeout=timeout)
-        logger.info(f"✅ کلیک شد: {text}")
-        return True
+        await locator.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+
+    # روش ۱: کلیک عادی
+    try:
+        await locator.click(timeout=4000)
+        logger.info(f"   ↳ [{label}] کلیک عادی انجام شد")
+        return 'normal'
     except Exception as e:
-        logger.warning(f"⚠️ کلیک روی '{text}' ناموفق: {type(e).__name__}")
-        return False
+        logger.info(f"   ↳ [{label}] کلیک عادی ناموفق ({type(e).__name__})")
+
+    # روش ۲: کلیک با مختصات وسط المان
+    try:
+        box = await locator.bounding_box()
+        if box:
+            page = locator.page
+            x = box['x'] + box['width'] / 2
+            y = box['y'] + box['height'] / 2
+            await page.mouse.click(x, y)
+            logger.info(f"   ↳ [{label}] کلیک با مختصات ({x:.0f}, {y:.0f})")
+            return 'coords'
+    except Exception as e:
+        logger.info(f"   ↳ [{label}] کلیک با مختصات ناموفق ({type(e).__name__})")
+
+    # روش ۳: dispatch_event
+    try:
+        await locator.dispatch_event('click')
+        logger.info(f"   ↳ [{label}] dispatch_event انجام شد")
+        return 'dispatch'
+    except Exception as e:
+        logger.info(f"   ↳ [{label}] dispatch_event ناموفق ({type(e).__name__})")
+
+    return None
+
+
+def clickable_locator(page, text):
+    """دکمه‌های کلیک‌پذیر با متن دقیق؛ اگه نبود get_by_text"""
+    pattern = re.compile(rf'^\s*{re.escape(text)}\s*$')
+    primary = page.locator('button, [role="button"], a').filter(has_text=pattern)
+    return primary
+
+
+async def list_buttons(page, text):
+    """لیست دکمه‌های قابل‌دیدن و فعال با متن مشخص (ابتدا کلیک‌پذیرها، بعد get_by_text)"""
+    found = []
+    for loc in (clickable_locator(page, text), page.get_by_text(text, exact=True)):
+        try:
+            count = await loc.count()
+        except Exception:
+            continue
+        for idx in range(count):
+            item = loc.nth(idx)
+            try:
+                if await item.is_visible() and await item.is_enabled():
+                    found.append(item)
+            except Exception:
+                continue
+        if found:
+            break
+    return found
+
+
+async def count_buttons(page, text):
+    return len(await list_buttons(page, text))
+
+
+async def click_text(page, text, timeout=15000):
+    """کلیک روی اولین دکمه‌ی قابل‌دیدن با متن مشخص (با انتظار)"""
+    deadline = asyncio.get_event_loop().time() + timeout / 1000
+    while True:
+        buttons = await list_buttons(page, text)
+        if buttons:
+            method = await robust_click(buttons[0], text)
+            if method:
+                logger.info(f"✅ کلیک شد: {text} (روش: {method})")
+                return True
+        if asyncio.get_event_loop().time() >= deadline:
+            logger.warning(f"⚠️ دکمه‌ی '{text}' پیدا یا کلیک نشد")
+            return False
+        await asyncio.sleep(1)
+
+
+async def click_visible(page, text, randomize=False):
+    """کلیک روی یکی از دکمه‌های قابل‌دیدن (اولی، یا رندم)"""
+    buttons = await list_buttons(page, text)
+    if randomize:
+        random.shuffle(buttons)
+    for btn in buttons:
+        method = await robust_click(btn, text)
+        if method:
+            logger.info(f"✅ کلیک شد: {text} (روش: {method})")
+            return True
+    return False
 
 
 async def close_extra_tabs(context, page):
@@ -229,7 +323,7 @@ async def close_extra_tabs(context, page):
                 pass
 
     # اگه صفحه‌ی خود اپ به جای دیگه رفته، برگرد
-    if page.url and 'atfminers.asloni.online' not in page.url:
+    if page.url and APP_HOST not in page.url:
         try:
             await page.go_back(timeout=15000)
             logger.info("↩️ برگشت به اپ")
@@ -237,32 +331,69 @@ async def close_extra_tabs(context, page):
             pass
 
 
-async def click_visible(page, text, randomize=False):
-    """کلیک روی یکی از دکمه‌های قابل‌دیدن و فعال با متن مشخص (اولی، یا رندم)"""
+# ---------- آنلاین شدن ----------
+
+async def is_online(page):
     try:
-        items = page.get_by_text(text, exact=True)
-        count = await items.count()
-        indexes = list(range(count))
-        if randomize:
-            random.shuffle(indexes)
-        for idx in indexes:
-            btn = items.nth(idx)
-            try:
-                if not await btn.is_visible():
-                    continue
-                if not await btn.is_enabled():
-                    continue
-                await btn.click(timeout=5000)
-                logger.info(f"✅ کلیک شد: {text} (شماره {idx+1} از {count})")
-                return True
-            except Exception:
-                continue
-    except Exception as e:
-        logger.warning(f"⚠️ کلیک '{text}' ناموفق: {type(e).__name__}")
+        return await page.get_by_text('ONLINE', exact=True).first.is_visible(timeout=1000)
+    except Exception:
+        return False
+
+
+async def wait_until_online(page, action_log):
+    """گشت بین تب‌ها تا وضعیت ONLINE ظاهر بشه (حداکثر ONLINE_WAIT_MAX ثانیه)"""
+    if await is_online(page):
+        logger.info("🟢 اپ از قبل ONLINE است")
+        return True
+
+    logger.info("🕐 اپ هنوز ONLINE نیست، شروع گشت اولیه...")
+    start = asyncio.get_event_loop().time()
+    tabs = WARMUP_TABS[:]
+    random.shuffle(tabs)
+    tab_idx = 0
+
+    while asyncio.get_event_loop().time() - start < ONLINE_WAIT_MAX:
+        if await is_online(page):
+            elapsed = asyncio.get_event_loop().time() - start
+            logger.info(f"🟢 اپ ONLINE شد (بعد از {elapsed:.0f} ثانیه)")
+            action_log.append({
+                'action': 'WAIT_ONLINE',
+                'time': datetime.now().isoformat(),
+                'seconds': round(elapsed),
+                'success': True,
+            })
+            return True
+
+        tab = tabs[tab_idx % len(tabs)]
+        tab_idx += 1
+        await click_text(page, tab, timeout=5000)
+        await asyncio.sleep(random.uniform(15, 30))
+        await click_text(page, 'Mine', timeout=5000)
+        await asyncio.sleep(random.uniform(10, 20))
+
+    logger.warning("⚠️ تا سقف زمان، ONLINE ظاهر نشد؛ ادامه با هشدار")
+    await save_shot(page, '01b_not_online')
+    action_log.append({
+        'action': 'WAIT_ONLINE',
+        'time': datetime.now().isoformat(),
+        'success': False,
+    })
     return False
 
 
 # ---------- صفحه‌ی اول: دایره‌ی ATF و CLAIM ----------
+
+async def read_gain(page):
+    """خواندن عدد +x.xxxx بالای دایره (برای تایید اثر تپ و Claim)"""
+    try:
+        body = await page.inner_text('body', timeout=3000)
+        m = re.search(r'\+\s*(\d+(?:\.\d+)?)', body)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
 
 async def find_coin_center(page):
     """پیدا کردن مرکز دایره‌ی ATF (المان تقریباً مربعی و بزرگ نزدیک مرکز صفحه)"""
@@ -293,30 +424,28 @@ async def find_coin_center(page):
         logger.warning(f"⚠️ جستجوی دایره ناموفق: {type(e).__name__}")
         candidates = []
 
-    # فقط اونایی که تقریباً وسط افقی صفحه و توی بخش میانی عمودی هستن
     good = [
         c for c in candidates
         if abs(c['x'] - vw / 2) < vw * 0.15 and vh * 0.30 < c['y'] < vh * 0.80
     ]
     if good:
-        # اولویت با img و canvas، بعد نزدیک‌ترین به مرکز افقی
         good.sort(key=lambda c: (c['tag'] not in ('IMG', 'CANVAS'), abs(c['x'] - vw / 2)))
         c = good[0]
         logger.info(f"🪙 دایره پیدا شد ({c['tag']}, عرض {c['w']:.0f}) در ({c['x']:.0f}, {c['y']:.0f})")
         return c['x'], c['y'], min(c['w'], 300)
 
-    # روش جایگزین: نقطه‌ی تقریبی وسط صفحه
     fx, fy = vw * 0.5, vh * 0.52
     logger.warning(f"⚠️ دایره پیدا نشد، استفاده از نقطه‌ی تقریبی ({fx:.0f}, {fy:.0f})")
     return fx, fy, 200
 
 
 async def tap_coin(page, action_log):
-    """چند بار تپ روی دایره‌ی ATF"""
+    """چند بار تپ روی دایره‌ی ATF و ثبت تغییر عدد بالای دایره"""
     x, y, size = await find_coin_center(page)
     taps = random.randint(*COIN_TAPS)
     spread = max(10, size * 0.12)
-    logger.info(f"👆 شروع {taps} تپ روی دایره‌ی ATF")
+    before = await read_gain(page)
+    logger.info(f"👆 شروع {taps} تپ روی دایره‌ی ATF (عدد قبل: {before})")
 
     done = 0
     for i in range(taps):
@@ -333,11 +462,20 @@ async def tap_coin(page, action_log):
         done += 1
         await asyncio.sleep(random.uniform(*COIN_TAP_DELAY))
 
-    logger.info(f"🎯 تعداد تپ انجام‌شده روی دایره: {done} از {taps}")
+    await asyncio.sleep(1.5)
+    after = await read_gain(page)
+    changed = (before is not None and after is not None and before != after)
+    logger.info(
+        f"🎯 تپ انجام‌شده: {done} از {taps} | عدد قبل: {before} ← بعد: {after} "
+        f"| {'✅ اثر داشت' if changed else '❓ تغییر عدد دیده نشد'}"
+    )
     action_log.append({
         'action': 'COIN_TAPS',
         'time': datetime.now().isoformat(),
         'count': done,
+        'gain_before': before,
+        'gain_after': after,
+        'effect_seen': changed,
         'success': done > 0,
     })
     await random_delay(1, 3)
@@ -352,9 +490,13 @@ async def multi_claim(page, action_log):
 
     done = 0
     for i in range(clicks):
+        before = await read_gain(page)
         ok = await click_text(page, 'CLAIM', timeout=5000)
         if ok:
             done += 1
+            await asyncio.sleep(2)
+            after = await read_gain(page)
+            logger.info(f"   عدد قبل از CLAIM: {before} ← بعد: {after}")
         await random_delay(*CLAIM_CLICK_DELAY)
 
     logger.info(f"🎯 تعداد کلیک CLAIM: {done} از {clicks}")
@@ -367,63 +509,105 @@ async def multi_claim(page, action_log):
     return done
 
 
+# ---------- تسک‌ها ----------
+
 async def claim_ready_tasks(page, action_log):
-    """کلیک روی همه‌ی Claim های آماده‌ی تسک‌ها (تسک‌هایی که Go شون قبلاً خورده)"""
+    """کلیک روی همه‌ی Claim های آماده‌ی تسک‌ها با تایید اثر (کم شدن تعداد Claim)"""
     claimed = 0
     for n in range(MAX_TASKS):
-        count = await page.get_by_text('Claim', exact=True).count()
-        logger.info(f"🔎 تعداد دکمه‌ی Claim تسک: {count}")
-        if count == 0:
+        before = await count_buttons(page, 'Claim')
+        logger.info(f"🔎 تعداد دکمه‌ی Claim تسک (قابل‌کلیک): {before}")
+        if before == 0:
             break
 
-        ok = await click_visible(page, 'Claim', randomize=True)
+        await save_shot(page, f'04_claim{n+1}_before')
+        ok = await click_visible(page, 'Claim', randomize=False)
+        await asyncio.sleep(3)
+        after = await count_buttons(page, 'Claim')
+        effect = after < before
+        logger.info(
+            f"   Claim {n+1}: کلیک={'✅' if ok else '❌'} | تعداد قبل: {before} ← بعد: {after} "
+            f"| {'✅ اثر داشت' if effect else '❓ اثری دیده نشد'}"
+        )
         action_log.append({
             'action': f'READY_CLAIM_{n+1}',
             'time': datetime.now().isoformat(),
+            'before': before,
+            'after': after,
+            'effect_seen': effect,
             'success': ok,
         })
+        await save_shot(page, f'04_claim{n+1}_after')
+
         if not ok:
             break
+        if effect:
+            claimed += 1
+        else:
+            # اثر نداشت؛ احتمالاً دکمه‌ی دیگه‌ای هست یا اپ قبول نکرده. یه بار دیگه سعی نکن.
+            break
 
-        claimed += 1
         await random_delay(3, 5)
-        await save_shot(page, f'04_ready_claim_{n+1}')
 
-    logger.info(f"🎯 تعداد Claim های انجام‌شده: {claimed}")
+    logger.info(f"🎯 تعداد Claim های موفق (با اثر): {claimed}")
     return claimed
 
 
 async def process_go_tasks(context, page, action_log):
-    """تسک‌هایی که هنوز Go دارن: Go ← برگشت ← صبر ← Claim"""
-    go_count = await page.get_by_text('Go', exact=True).count()
-    logger.info(f"📋 تعداد دکمه‌ی Go: {go_count}")
+    """تسک‌هایی که هنوز Go دارن: Go ← بررسی تب جدید ← برگشت ← صبر ← Claim"""
+    go_count = await count_buttons(page, 'Go')
+    logger.info(f"📋 تعداد دکمه‌ی Go (قابل‌کلیک): {go_count}")
 
     for i in range(min(go_count, MAX_TASKS)):
         logger.info(f"📋 پردازش تسک Go شماره {i+1}")
+        pages_before = len(context.pages)
+        url_before = page.url
+        await save_shot(page, f'05_go{i+1}_before')
 
-        # الف) کلیک روی یکی از Go ها (رندم)
         go_ok = await click_visible(page, 'Go', randomize=True)
+        await asyncio.sleep(3)
+
+        opened_tab = len(context.pages) > pages_before
+        url_changed = page.url != url_before
+        effect = opened_tab or url_changed
+        logger.info(
+            f"   Go {i+1}: کلیک={'✅' if go_ok else '❌'} | تب جدید: {opened_tab} "
+            f"| تغییر آدرس: {url_changed} | {'✅ اثر داشت' if effect else '❓ اثری دیده نشد'}"
+        )
         action_log.append({
             'action': f'GO_{i+1}',
             'time': datetime.now().isoformat(),
+            'opened_tab': opened_tab,
+            'url_changed': url_changed,
             'success': go_ok,
         })
         if not go_ok:
             break
 
-        # ب) چند ثانیه روی صفحه‌ی خارجی، بعد بستن و برگشت
+        # چند ثانیه روی صفحه‌ی خارجی، بعد بستن و برگشت
         await random_delay(4, 7)
         await close_extra_tabs(context, page)
 
-        # پ) صبر تا دکمه‌ی Claim تسک فعال بشه
+        # صبر تا دکمه‌ی Claim تسک فعال بشه
         await random_delay(*CLAIM_WAIT)
         await save_shot(page, f'05_go{i+1}_before_claim')
 
-        # ت) کلیک روی Claim تسک
-        claim_ok = await click_visible(page, 'Claim', randomize=True)
+        claims_before = await count_buttons(page, 'Claim')
+        claim_ok = await click_visible(page, 'Claim', randomize=False)
+        await asyncio.sleep(3)
+        claims_after = await count_buttons(page, 'Claim')
+        claim_effect = claims_after < claims_before
+        logger.info(
+            f"   Claim بعد از Go {i+1}: کلیک={'✅' if claim_ok else '❌'} "
+            f"| قبل: {claims_before} ← بعد: {claims_after} "
+            f"| {'✅ اثر داشت' if claim_effect else '❓ اثری دیده نشد'}"
+        )
         action_log.append({
             'action': f'GO_CLAIM_{i+1}',
             'time': datetime.now().isoformat(),
+            'before': claims_before,
+            'after': claims_after,
+            'effect_seen': claim_effect,
             'success': claim_ok,
         })
 
@@ -492,6 +676,11 @@ async def run_miner(url, action_log):
             await page.goto(url, wait_until='networkidle', timeout=60000)
             await random_delay(3, 6)
             await save_shot(page, '01_mine')
+
+            # صبر تا اپ ONLINE بشه (گشت اولیه)
+            await wait_until_online(page, action_log)
+            await click_text(page, 'Mine', timeout=5000)
+            await random_delay(2, 4)
 
             mine_first = random.random() < 0.5
             logger.info(f"🎲 ترتیب این اجرا: {'Mine ← Tasks' if mine_first else 'Tasks ← Mine'}")
