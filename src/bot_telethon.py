@@ -5,7 +5,7 @@ import logging
 import random
 import json
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient
@@ -34,9 +34,6 @@ SESSION_NAME = 'user_session'  # نام فایل session (فقط برای اجر
 # اجرای اجباری (بدون بررسی زمان‌بندی) - برای اجرای دستی
 FORCE_RUN = os.getenv('FORCE_RUN', 'false').strip().lower() == 'true'
 
-# ذخیره‌ی DOM برای دیباگ (با DUMP_DOM=false خاموش می‌شه)
-DUMP_DOM = os.getenv('DUMP_DOM', 'true').strip().lower() != 'false'
-
 BOT_USERNAME = 'ATF_AIRDROP_bot'
 WEBAPP_BASE = 'https://atfminers.asloni.online/miner/index.html'
 APP_HOST = 'atfminers.asloni.online'
@@ -49,7 +46,9 @@ MAX_GAP_MIN = 65
 RETRY_GAP_MIN = (20, 40)
 
 # --- آنلاین شدن اپ ---
-ONLINE_WAIT_MAX = 180
+ONLINE_WAIT_MAX = 180         # صبر برای ONLINE شدن اول کار (ثانیه)
+ONLINE_EXIT_WAIT = 150        # صبر برای ONLINE بودن قبل از خروج (ثانیه)
+RETRY_IF_OFFLINE = True       # اگه موقع خروج ONLINE نبود، اجرای بعدی زودتر (۲۰ تا ۴۰ دقیقه)
 WARMUP_TABS = ['Miners', 'Friends', 'Profile']
 
 # --- صفحه‌ی اول (Mine) ---
@@ -65,11 +64,21 @@ EXTRA_PAUSE_CHANCE = 0.15
 FINAL_MINE_CLAIM_CHANCE = 1.0
 WANDER_TABS = ['Miners', 'Friends', 'Profile']
 
-# --- تسک‌ها ---
-AFTER_GO_WAIT = (4, 8)        # صبر کوتاه بعد از Go (مثل دیدن صفحه‌ی خارجی)
-CLAIM_APPEAR_MAX = 45         # حداکثر صبر برای تبدیل شدن Go به Claim بعد از شبیه‌سازی برگشت (ثانیه)
-ROW_CHECK_FIRST = 8           # صبر قبل از اولین بررسی تغییر ردیف (ثانیه)
-MAX_TASKS = 6
+# --- تسک‌ها: (id دکمه بدون btn-، برچسب، حداقل ثانیه‌ی Processing طبق کد اپ) ---
+TASKS = [
+    ('youtube_like_comment', 'YouTube Like & Comment', 30),
+    ('twitter_retweet', 'X Retweet', 30),
+    ('website_visit', 'Visit Website', 10),
+    ('telegram_react_latest', 'React to latest post', 20),
+    ('bio_referral', 'Keep ATF in Bio', 0),
+    ('name_eye', 'Keep eye in Name', 0),
+]
+GO_SETTLE_WAIT = 6        # صبر بعد از تپ Go تا متن دکمه عوض بشه (ثانیه)
+PROCESSING_MARGIN = 15    # حاشیه‌ی اضافه روی minSeconds برای ظاهر شدن Claim (ثانیه)
+CLAIM_RESULT_WAIT = 30    # حداکثر صبر برای نتیجه‌ی Claim (ثانیه)
+
+# درخواست‌های سرور که لاگ می‌شن
+TASK_ACTIONS = {'start_task', 'claim_task', 'bio_task_claim', 'name_eye_task_claim'}
 
 if not API_ID_RAW or not API_HASH:
     raise SystemExit("❌ API_ID یا API_HASH تنظیم نشده (توی Secrets و env چک کن)")
@@ -91,27 +100,11 @@ else:
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
-# اسکریپتی که قبل از لود اپ تزریق می‌شه:
-# - openLink و window.open رو می‌گیره و ثبت می‌کنه
-# - ثبت می‌کنه اپ به چه رویدادهایی (visibilitychange، focus، ...) گوش می‌ده
+# اسکریپتی که قبل از لود اپ تزریق می‌شه: openLink و window.open رو می‌گیره (لینک بیرونی باز نشه)
 INIT_SCRIPT = """
 (() => {
   window.__openedLinks = [];
-  window.__listenTypes = {};
-  window.__tgEvents = {};
   const record = (u) => { try { window.__openedLinks.push(String(u)); } catch (e) {} };
-
-  // ثبت نوع رویدادهایی که روی window/document گوش داده می‌شه
-  const origAdd = EventTarget.prototype.addEventListener;
-  EventTarget.prototype.addEventListener = function (type, fn, opts) {
-    try {
-      if (this === window || this === document) {
-        const k = (this === window ? 'window:' : 'document:') + type;
-        window.__listenTypes[k] = (window.__listenTypes[k] || 0) + 1;
-      }
-    } catch (e) {}
-    return origAdd.call(this, type, fn, opts);
-  };
 
   window.open = function (u) { record(u); return null; };
 
@@ -121,15 +114,6 @@ INIT_SCRIPT = """
     tg.__patched = true;
     try { tg.openLink = function (u) { record(u); }; } catch (e) {}
     try { tg.openTelegramLink = function (u) { record(u); }; } catch (e) {}
-    try {
-      const origOn = tg.onEvent && tg.onEvent.bind(tg);
-      if (origOn) {
-        tg.onEvent = function (type, cb) {
-          window.__tgEvents[type] = (window.__tgEvents[type] || 0) + 1;
-          return origOn(type, cb);
-        };
-      }
-    } catch (e) {}
   };
 
   patchWebApp();
@@ -149,267 +133,34 @@ INIT_SCRIPT = """
 })();
 """
 
-# شبیه‌سازی «رفتن به صفحه‌ی بیرونی و برگشتن»
-SIMULATE_RETURN_JS = """
-() => {
-  const fire = (target, type) => { try { target.dispatchEvent(new Event(type)); } catch (e) {} };
-  const setHidden = (hidden) => {
-    try {
-      Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
-      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (hidden ? 'hidden' : 'visible') });
-    } catch (e) {}
-  };
-  const tg = window.Telegram && window.Telegram.WebApp;
-  const tgFire = (type) => {
-    try { if (tg && tg.receiveEvent) tg.receiveEvent(type, {}); } catch (e) {}
-    try {
-      if (window.Telegram && window.Telegram.WebView && window.Telegram.WebView.receiveEvent) {
-        window.Telegram.WebView.receiveEvent(type, {});
-      }
-    } catch (e) {}
-  };
 
-  // رفتن
-  fire(window, 'blur');
-  setHidden(true);
-  fire(document, 'visibilitychange');
-  fire(window, 'pagehide');
-  tgFire('visibility_changed');
-  tgFire('deactivated');
-
-  // برگشت (بعد از چند ثانیه، با تاخیر)
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      setHidden(false);
-      fire(document, 'visibilitychange');
-      fire(window, 'pageshow');
-      fire(window, 'focus');
-      tgFire('visibility_changed');
-      tgFire('activated');
-      tgFire('viewport_changed');
-      resolve(true);
-    }, 4000);
-  });
-}
-"""
-
-# ذخیره‌ی سورس توابع مرتبط اپ (با پاک کردن توکن‌های بلند)
-APP_FUNCTIONS_JS = """
-() => {
-  const out = [];
-  const nameRe = /task|claim|visib|return|focus|openlink|reward|verify|process|check/i;
-  const redact = (s) => s.replace(/[A-Za-z0-9_\\-]{40,}/g, '<redacted>');
-  let total = 0;
-  const names = Object.getOwnPropertyNames(window).filter((k) => {
-    try { return typeof window[k] === 'function' && nameRe.test(k); } catch (e) { return false; }
-  });
-  if (typeof window.handleTaskClick === 'function' && !names.includes('handleTaskClick')) names.unshift('handleTaskClick');
-  names.sort((a, b) => (a === 'handleTaskClick' ? -1 : b === 'handleTaskClick' ? 1 : 0));
-  for (const k of names) {
-    let src = '';
-    try { src = window[k].toString(); } catch (e) { continue; }
-    if (src.includes('[native code]')) continue;
-    src = redact(src).slice(0, 6000);
-    if (total + src.length > 90000) break;
-    total += src.length;
-    out.push('// ===== ' + k + ' =====\\n' + src);
-  }
-  return {
-    functions: out,
-    listenTypes: window.__listenTypes || {},
-    tgEvents: window.__tgEvents || {},
-    hasTelegram: !!(window.Telegram && window.Telegram.WebApp),
-    platform: (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.platform) || '',
-  };
-}
-"""
-
-# --- جاوااسکریپت ذخیره‌ی DOM ---
-
-# HTML صفحه بدون script/noscript و بدون داده‌ی سنگین
-DOM_HTML_JS = """
-() => {
-  const clone = document.documentElement.cloneNode(true);
-  clone.querySelectorAll('script,noscript').forEach((e) => e.remove());
-  clone.querySelectorAll('img[src^="data:"]').forEach((e) => e.setAttribute('src', 'data:(حذف شد)'));
-  clone.querySelectorAll('input,textarea').forEach((e) => e.removeAttribute('value'));
-  return clone.outerHTML;
-}
-"""
-
-# خلاصه‌ی المان‌های کلیک‌پذیر و دکمه‌های Go/Claim/CLAIM/Processing با والدها
-DOM_SUMMARY_JS = """
-() => {
-  const short = (s, n) => (s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
-  const cls = (el) => (typeof el.className === 'string' ? el.className : (el.getAttribute('class') || ''));
-  const desc = (el) => {
-    const r = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    return {
-      tag: el.tagName.toLowerCase(),
-      id: el.id || '',
-      class: short(cls(el), 80),
-      role: el.getAttribute('role') || '',
-      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
-      pe: cs.pointerEvents,
-      cursor: cs.cursor,
-      rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
-      text: short(el.innerText, 60),
-    };
-  };
-
-  const out = { clickable: [], actions: [] };
-
-  document.querySelectorAll('button,[role="button"],a,[onclick]').forEach((el) => {
-    out.clickable.push(desc(el));
-  });
-
-  const wanted = /^(go|claim|processing\\.*|checking\\.*|verifying\\.*)$/i;
-  document.querySelectorAll('body *').forEach((el) => {
-    const t = short(el.innerText, 30);
-    if (!wanted.test(t)) return;
-    const deeper = Array.from(el.children).some((c) => wanted.test(short(c.innerText, 30)));
-    if (deeper) return;
-    const chain = [];
-    let cur = el;
-    for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
-      chain.push(desc(cur));
-      cur = cur.parentElement;
-    }
-    out.actions.push({ text: t, chain });
-  });
-
-  out.openedLinks = (window.__openedLinks || []).map((u) => {
-    try { return new URL(u).host; } catch (e) { return String(u).slice(0, 40); }
-  });
-  out.url = location.origin + location.pathname;
-  return out;
-}
-"""
-
-
-def _fmt(d):
-    return (
-        f"<{d['tag']}"
-        f"{' #' + d['id'] if d['id'] else ''}"
-        f"{' .' + d['class'] if d['class'] else ''}"
-        f"{' role=' + d['role'] if d['role'] else ''}>"
-        f" rect={d['rect']} pe={d['pe']} cursor={d['cursor']}"
-        f"{' DISABLED' if d['disabled'] else ''} text=«{d['text']}»"
-    )
-
-
-async def dump_dom(page, name):
-    """ذخیره‌ی خلاصه‌ی دکمه‌ها (و HTML بدون script) برای دیباگ"""
-    if not DUMP_DOM:
-        return
-    try:
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-        # HTML فقط برای چند مرحله‌ی کلیدی ذخیره می‌شه تا حجم artifact کم بمونه
-        if name in ('tasks', 'go1_after'):
-            html = await page.evaluate(DOM_HTML_JS)
-            if len(html) > 600000:
-                html = html[:600000] + '\n<!-- بریده شد -->'
-            with open(os.path.join(SCREENSHOT_DIR, f'dom_{name}.html'), 'w', encoding='utf-8') as f:
-                f.write(html)
-
-        summary = await page.evaluate(DOM_SUMMARY_JS)
-        lines = [
-            f"# DOM خلاصه: {name}",
-            f"# آدرس: {summary.get('url')}",
-            f"# لینک‌های ثبت‌شده (فقط دامنه): {summary.get('openedLinks')}",
-            "",
-            f"## دکمه‌های Go / Claim / Processing ({len(summary['actions'])} مورد)",
-        ]
-        for i, a in enumerate(summary['actions'], 1):
-            lines.append(f"[{i}] متن: {a['text']}")
-            for lvl, d in enumerate(a['chain']):
-                lines.append(f"    {'  ' * lvl}↑{lvl} {_fmt(d)}")
-        lines.append("")
-        lines.append(f"## همه‌ی المان‌های کلیک‌پذیر ({len(summary['clickable'])} مورد)")
-        for d in summary['clickable']:
-            lines.append(f"  {_fmt(d)}")
-
-        with open(os.path.join(SCREENSHOT_DIR, f'dom_{name}.txt'), 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-        logger.info(f"🧬 DOM ذخیره شد: dom_{name}")
-    except Exception as e:
-        logger.warning(f"⚠️ ذخیره‌ی DOM ناموفق ({name}): {type(e).__name__}")
-
-
-async def dump_app_functions(page):
-    """ذخیره‌ی سورس handleTaskClick و توابع مرتبط + رویدادهایی که اپ گوش می‌ده"""
-    if not DUMP_DOM:
-        return
-    try:
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-        info = await page.evaluate(APP_FUNCTIONS_JS)
-        lines = [
-            f"# Telegram.WebApp موجود: {info.get('hasTelegram')} | platform: {info.get('platform')}",
-            f"# رویدادهای window/document که اپ گوش می‌ده: {json.dumps(info.get('listenTypes'), ensure_ascii=False)}",
-            f"# رویدادهای SDK تلگرام (onEvent): {json.dumps(info.get('tgEvents'), ensure_ascii=False)}",
-            f"# تعداد توابع ذخیره‌شده: {len(info.get('functions', []))}",
-            "",
-        ]
-        lines.extend(info.get('functions', []))
-        with open(os.path.join(SCREENSHOT_DIR, 'app_functions.txt'), 'w', encoding='utf-8') as f:
-            f.write('\n\n'.join(lines))
-        logger.info(
-            f"🧬 app_functions.txt ذخیره شد ({len(info.get('functions', []))} تابع) | "
-            f"رویدادها: {list((info.get('listenTypes') or {}).keys())} | tg: {list((info.get('tgEvents') or {}).keys())}"
-        )
-    except Exception as e:
-        logger.warning(f"⚠️ ذخیره‌ی توابع اپ ناموفق: {type(e).__name__}")
+def redact(s):
+    return re.sub(r'[A-Za-z0-9_\-]{40,}', '<redacted>', s or '')
 
 
 def attach_diagnostics(page):
-    """لاگ خطاهای کنسول، dialog ها و درخواست‌های fetch/xhr (فقط متد/مسیر/status، بدون query و بدنه)"""
+    """لاگ خطاهای صفحه و درخواست‌های تسک (اکشن + status + خلاصه‌ی کوتاه جواب)"""
 
-    def short_url(u):
+    def action_of(url):
         try:
-            p = urlparse(u)
-            return f"{p.netloc}{p.path}"[:100]
+            return parse_qs(urlparse(url).query).get('action', ['-'])[0]
         except Exception:
-            return str(u)[:100]
+            return '-'
 
-    def on_console(msg):
+    async def on_response(resp):
         try:
-            if msg.type in ('error', 'warning'):
-                logger.info(f"🖥️ console.{msg.type}: {msg.text[:200]}")
-        except Exception:
-            pass
-
-    def on_pageerror(err):
-        logger.info(f"💥 pageerror: {str(err)[:200]}")
-
-    async def on_dialog(dialog):
-        logger.info(f"💬 dialog({dialog.type}): {dialog.message[:150]}")
-        try:
-            await dialog.accept()
+            if 'index.php' not in resp.url:
+                return
+            action = action_of(resp.url)
+            if action not in TASK_ACTIONS:
+                return
+            text = await resp.text()
+            logger.info(f"📡 {action} → {resp.status} | {redact(text)[:180]}")
         except Exception:
             pass
 
-    def on_response(resp):
-        try:
-            rt = resp.request.resource_type
-            if rt in ('fetch', 'xhr'):
-                logger.info(f"🌐 {resp.request.method} {short_url(resp.url)} → {resp.status}")
-        except Exception:
-            pass
-
-    def on_requestfailed(req):
-        try:
-            if req.resource_type in ('fetch', 'xhr'):
-                logger.info(f"🚫 ناموفق: {req.method} {short_url(req.url)}")
-        except Exception:
-            pass
-
-    page.on('console', on_console)
-    page.on('pageerror', on_pageerror)
-    page.on('dialog', lambda d: asyncio.ensure_future(on_dialog(d)))
-    page.on('response', on_response)
-    page.on('requestfailed', on_requestfailed)
+    page.on('response', lambda r: asyncio.ensure_future(on_response(r)))
+    page.on('pageerror', lambda e: logger.info(f"💥 pageerror: {redact(str(e))[:160]}"))
 
 
 # ---------- زمان‌بندی ----------
@@ -444,8 +195,8 @@ def schedule_next_run():
     save_next_run(random.randint(MIN_GAP_MIN, MAX_GAP_MIN), 'success')
 
 
-def schedule_retry():
-    save_next_run(random.randint(*RETRY_GAP_MIN), 'retry')
+def schedule_retry(reason='retry'):
+    save_next_run(random.randint(*RETRY_GAP_MIN), reason)
 
 
 def is_due():
@@ -526,10 +277,10 @@ async def save_shot(page, name):
         logger.warning(f"⚠️ اسکرین‌شات ذخیره نشد: {e}")
 
 
-# ---------- کلیک مطمئن ----------
+# ---------- کلیک ----------
 
 async def robust_click(locator, label=''):
-    """کلیک با سه روش پشت‌سرهم: عادی، با مختصات، dispatch_event"""
+    """کلیک با سه روش پشت‌سرهم: عادی، با مختصات، dispatch_event (برای تب‌ها و Mine)"""
     try:
         await locator.scroll_into_view_if_needed(timeout=3000)
     except Exception:
@@ -564,6 +315,31 @@ async def robust_click(locator, label=''):
     return None
 
 
+async def tap_locator(page, locator, label=''):
+    """تپ لمسی وسط المان (اپ به کلیک ماوس روی دکمه‌های تسک واکنش نشون نمی‌ده)"""
+    try:
+        await locator.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        box = await locator.bounding_box()
+        if box:
+            x = box['x'] + box['width'] / 2 + random.uniform(-box['width'] * 0.2, box['width'] * 0.2)
+            y = box['y'] + box['height'] / 2 + random.uniform(-box['height'] * 0.2, box['height'] * 0.2)
+            await page.touchscreen.tap(x, y)
+            logger.info(f"   👆 [{label}] تپ لمسی ({x:.0f}, {y:.0f})")
+            return True
+    except Exception as e:
+        logger.info(f"   ↳ [{label}] تپ لمسی ناموفق ({type(e).__name__})")
+    try:
+        await locator.click(timeout=4000)
+        logger.info(f"   ↳ [{label}] کلیک عادی (جایگزین)")
+        return True
+    except Exception as e:
+        logger.info(f"   ↳ [{label}] کلیک جایگزین هم ناموفق ({type(e).__name__})")
+    return False
+
+
 def clickable_locator(page, text):
     pattern = re.compile(rf'^\s*{re.escape(text)}\s*$')
     return page.locator('button, [role="button"], a').filter(has_text=pattern)
@@ -589,10 +365,6 @@ async def list_buttons(page, text):
     return found
 
 
-async def count_buttons(page, text):
-    return len(await list_buttons(page, text))
-
-
 async def click_text(page, text, timeout=15000):
     deadline = asyncio.get_event_loop().time() + timeout / 1000
     while True:
@@ -608,82 +380,107 @@ async def click_text(page, text, timeout=15000):
         await asyncio.sleep(1)
 
 
-async def click_visible(page, text, randomize=False):
-    buttons = await list_buttons(page, text)
-    if randomize:
-        random.shuffle(buttons)
-    for btn in buttons:
-        method = await robust_click(btn, text)
-        if method:
-            logger.info(f"✅ کلیک شد: {text} (روش: {method})")
-            return True
-    return False
-
-
-async def close_extra_tabs(context, page):
-    for extra in list(context.pages):
-        if extra != page:
-            try:
-                await extra.close()
-                logger.info("🗙 تب خارجی بسته شد")
-            except Exception:
-                pass
-
-    if page.url and APP_HOST not in page.url:
-        try:
-            await page.go_back(timeout=15000)
-            logger.info("↩️ برگشت به اپ")
-        except Exception:
-            pass
-
-
 # ---------- آنلاین شدن ----------
 
+async def read_status(page):
+    """متن وضعیت اپ (ONLINE یا هر چیز دیگه) از المنت #miningStatusHeader؛ None اگه پیدا نشد"""
+    try:
+        loc = page.locator('#miningStatusHeader')
+        if await loc.count() == 0:
+            return None
+        text = (await loc.first.text_content(timeout=2000)) or ''
+        text = text.strip().upper()
+        return text or None
+    except Exception:
+        return None
+
+
 async def is_online(page):
+    status = await read_status(page)
+    if status is not None:
+        return status == 'ONLINE'
     try:
         return await page.get_by_text('ONLINE', exact=True).first.is_visible(timeout=1000)
     except Exception:
         return False
 
 
+async def browse_for_online(page, max_seconds, label):
+    """گشت بین تب‌ها و برگشت به Mine تا وضعیت ONLINE بشه. True اگه ONLINE شد."""
+    start = asyncio.get_event_loop().time()
+    tabs = WARMUP_TABS[:]
+    random.shuffle(tabs)
+    tab_idx = 0
+
+    while True:
+        if await is_online(page):
+            return True
+        if asyncio.get_event_loop().time() - start >= max_seconds:
+            return False
+
+        status = await read_status(page)
+        logger.info(f"🕐 [{label}] هنوز ONLINE نیست (وضعیت: {status})، گشت کوتاه...")
+        tab = tabs[tab_idx % len(tabs)]
+        tab_idx += 1
+        await click_text(page, tab, timeout=5000)
+        await asyncio.sleep(random.uniform(12, 25))
+        await click_text(page, 'Mine', timeout=5000)
+        await asyncio.sleep(random.uniform(8, 15))
+
+
 async def wait_until_online(page, action_log):
+    """اول کار: صبر تا ONLINE بشه"""
     if await is_online(page):
         logger.info("🟢 اپ از قبل ONLINE است")
         return True
 
     logger.info("🕐 اپ هنوز ONLINE نیست، شروع گشت اولیه...")
     start = asyncio.get_event_loop().time()
-    tabs = WARMUP_TABS[:]
-    random.shuffle(tabs)
-    tab_idx = 0
+    ok = await browse_for_online(page, ONLINE_WAIT_MAX, 'شروع')
+    elapsed = asyncio.get_event_loop().time() - start
 
-    while asyncio.get_event_loop().time() - start < ONLINE_WAIT_MAX:
-        if await is_online(page):
-            elapsed = asyncio.get_event_loop().time() - start
-            logger.info(f"🟢 اپ ONLINE شد (بعد از {elapsed:.0f} ثانیه)")
-            action_log.append({
-                'action': 'WAIT_ONLINE',
-                'time': datetime.now().isoformat(),
-                'seconds': round(elapsed),
-                'success': True,
-            })
-            return True
+    if ok:
+        logger.info(f"🟢 اپ ONLINE شد (بعد از {elapsed:.0f} ثانیه)")
+    else:
+        logger.warning("⚠️ تا سقف زمان، ONLINE ظاهر نشد؛ ادامه با هشدار")
+        await save_shot(page, '01b_not_online')
 
-        tab = tabs[tab_idx % len(tabs)]
-        tab_idx += 1
-        await click_text(page, tab, timeout=5000)
-        await asyncio.sleep(random.uniform(15, 30))
-        await click_text(page, 'Mine', timeout=5000)
-        await asyncio.sleep(random.uniform(10, 20))
-
-    logger.warning("⚠️ تا سقف زمان، ONLINE ظاهر نشد؛ ادامه با هشدار")
-    await save_shot(page, '01b_not_online')
     action_log.append({
         'action': 'WAIT_ONLINE',
         'time': datetime.now().isoformat(),
-        'success': False,
+        'seconds': round(elapsed),
+        'success': ok,
     })
-    return False
+    return ok
+
+
+async def ensure_online_before_exit(page, action_log):
+    """آخر کار: مطمئن شو اپ ONLINE هست، بعد خارج شو. True اگه ONLINE تایید شد."""
+    logger.info("🔎 بررسی نهایی وضعیت قبل از خروج...")
+    await click_text(page, 'Mine', timeout=5000)
+    await asyncio.sleep(2)
+
+    start = asyncio.get_event_loop().time()
+    ok = await browse_for_online(page, ONLINE_EXIT_WAIT, 'خروج')
+    elapsed = asyncio.get_event_loop().time() - start
+    status = await read_status(page)
+
+    if ok:
+        logger.info(f"🟢 قبل از خروج، وضعیت ONLINE تایید شد (وضعیت: {status})")
+        await asyncio.sleep(random.uniform(4, 8))
+        await save_shot(page, '07_final')
+    else:
+        logger.warning(f"⚠️ قبل از خروج هم ONLINE نشد (وضعیت: {status})")
+        await save_shot(page, '07_final_not_online')
+
+    action_log.append({
+        'action': 'FINAL_ONLINE_CHECK',
+        'time': datetime.now().isoformat(),
+        'status': status,
+        'seconds': round(elapsed),
+        'success': ok,
+    })
+    return ok
 
 
 # ---------- صفحه‌ی اول: دایره‌ی ATF و CLAIM ----------
@@ -810,259 +607,71 @@ async def multi_claim(page, action_log):
     return done
 
 
-# ---------- تسک‌ها (ردیف‌محور) ----------
+# ---------- تسک‌ها (با تپ لمسی و id ثابت دکمه‌ها) ----------
 
-# پیدا کردن کارت ردیف از روی دکمه: بالاترین والدی که فقط یک دکمه‌ی Go/Claim داره
-ROW_JS = """
-(btn) => {
-  const isAction = (el) => {
-    const t = (el.innerText || '').trim();
-    return t === 'Go' || t === 'Claim';
-  };
-  let row = btn;
-  let cur = btn.parentElement;
-  while (cur && cur !== document.body) {
-    const actions = Array.from(cur.querySelectorAll('button,[role="button"],a,div,span'))
-      .filter((e) => e.children.length === 0 && isAction(e));
-    if (actions.length > 1) break;
-    row = cur;
-    cur = cur.parentElement;
-  }
-  return row;
-}
-"""
+def task_button(page, task_id):
+    return page.locator(f'#btn-{task_id}').first
 
 
-async def row_title(btn):
-    """عنوان کارت تسک (چند کلمه‌ی اول متن ردیف) برای شناسایی ردیف بعد از تغییر"""
+async def task_text(page, task_id):
+    """متن فعلی دکمه‌ی تسک؛ None اگه دکمه توی صفحه نیست"""
     try:
-        handle = await btn.evaluate_handle(ROW_JS)
-        text = await handle.evaluate("(el) => (el.innerText || '').trim()")
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        lines = [l for l in lines if l not in ('Go', 'Claim')]
-        return ' '.join(lines[:2])[:60]
-    except Exception:
-        return ''
-
-
-async def find_row_button(page, title, text):
-    """دکمه‌ای با متن مشخص (Go/Claim) داخل ردیفی که عنوانش title هست"""
-    if not title:
-        return None
-    for btn in await list_buttons(page, text):
-        if await row_title(btn) == title:
-            return btn
-    return None
-
-
-async def row_button_text(page, button_id):
-    """متن فعلی دکمه‌ی یک تسک (با id ثابتش مثل btn-youtube_like_comment)"""
-    if not button_id:
-        return None
-    try:
-        return (await page.locator(f'#{button_id}').first.inner_text(timeout=2000)).strip()
+        if await page.locator(f'#btn-{task_id}').count() == 0:
+            return None
+        return (await task_button(page, task_id).inner_text(timeout=2000)).strip()
     except Exception:
         return None
 
 
-async def read_opened_links(page):
-    try:
-        links = await page.evaluate("() => window.__openedLinks || []")
-    except Exception:
-        return []
-    out = []
-    for u in links:
-        try:
-            out.append(urlparse(u).netloc or u[:40])
-        except Exception:
-            out.append(str(u)[:40])
-    return out
+async def wait_text_change(page, task_id, old_text, timeout):
+    """صبر تا متن دکمه از old_text عوض بشه (یا دکمه ناپدید بشه)"""
+    end = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < end:
+        now = await task_text(page, task_id)
+        if now != old_text:
+            return now
+        await asyncio.sleep(1)
+    return await task_text(page, task_id)
 
 
-async def button_id_of(btn):
-    try:
-        return await btn.get_attribute('id')
-    except Exception:
-        return None
+def is_finished_text(text):
+    """بعد از Claim موفق: دکمه به تایمر (Next in ...) یا Done تبدیل می‌شه یا ناپدید می‌شه"""
+    return text is None or text.startswith('Next in') or text == 'Done'
 
 
-async def claim_ready_tasks(page, action_log):
-    """Claim همه‌ی تسک‌های آماده؛ موفقیت = تغییر متن/ناپدید شدن دکمه‌ی Claim همون ردیف"""
-    claimed = 0
-    seen_titles = set()
-    for n in range(MAX_TASKS):
-        buttons = await list_buttons(page, 'Claim')
-        target = None
-        title = ''
-        for b in buttons:
-            t = await row_title(b)
-            if t not in seen_titles:
-                target, title = b, t
-                break
-        if target is None:
+async def claim_task_button(page, task_id, label, action_log):
+    """تپ روی Claim یک تسک و صبر تا نتیجه (Processing ← Next in ...)"""
+    logger.info(f"💰 Claim تسک: {label}")
+    ok = await tap_locator(page, task_button(page, task_id), f'Claim {task_id}')
+    if not ok:
+        action_log.append({
+            'action': f'CLAIM_{task_id}',
+            'time': datetime.now().isoformat(),
+            'success': False,
+        })
+        return False
+
+    end = asyncio.get_event_loop().time() + CLAIM_RESULT_WAIT
+    final = await task_text(page, task_id)
+    while asyncio.get_event_loop().time() < end:
+        if is_finished_text(final):
             break
+        await asyncio.sleep(1.5)
+        final = await task_text(page, task_id)
 
-        seen_titles.add(title)
-        bid = await button_id_of(target)
-        logger.info(f"🔎 Claim تسک: «{title}» (id: {bid})")
-        await save_shot(page, f'04_claim{n+1}_before')
-        await dump_dom(page, f'claim{n+1}_before')
-        method = await robust_click(target, 'Claim')
-        await asyncio.sleep(4)
-
-        now_text = await row_button_text(page, bid)
-        effect = now_text is not None and now_text != 'Claim'
-        logger.info(
-            f"   Claim «{title}»: کلیک={'✅' if method else '❌'} | متن دکمه الان: «{now_text}» "
-            f"| {'✅ تغییر کرد' if effect else '❓ هنوز Claim هست'}"
-        )
-        action_log.append({
-            'action': f'READY_CLAIM_{n+1}',
-            'time': datetime.now().isoformat(),
-            'task': title,
-            'button_text_after': now_text,
-            'effect_seen': effect,
-            'success': bool(method),
-        })
-        await save_shot(page, f'04_claim{n+1}_after')
-        if effect:
-            claimed += 1
-        await random_delay(2, 4)
-
-    logger.info(f"🎯 تعداد Claim های موفق: {claimed}")
-    return claimed
+    success = is_finished_text(final)
+    logger.info(f"   {'✅ Claim شد' if success else '❓ نتیجه نامشخص'} | متن دکمه الان: «{final}»")
+    action_log.append({
+        'action': f'CLAIM_{task_id}',
+        'time': datetime.now().isoformat(),
+        'final_text': final,
+        'success': success,
+    })
+    await save_shot(page, f'05_claim_{task_id}')
+    return success
 
 
-async def process_go_tasks(context, page, action_log):
-    """هر Go: کلیک ← صبر ← (اگه تغییر نکرد) شبیه‌سازی برگشت ← تبدیل به Claim ← Claim همون ردیف"""
-    done_titles = set()
-    for i in range(MAX_TASKS):
-        target = None
-        title = ''
-        for b in await list_buttons(page, 'Go'):
-            t = await row_title(b)
-            if t not in done_titles:
-                target, title = b, t
-                break
-        if target is None:
-            break
-
-        done_titles.add(title)
-        bid = await button_id_of(target)
-        logger.info(f"📋 تسک Go شماره {i+1}: «{title}» (id: {bid})")
-        await save_shot(page, f'05_go{i+1}_before')
-        await dump_dom(page, f'go{i+1}_before')
-
-        links_before = len(await read_opened_links(page))
-        pages_before = len(context.pages)
-        method = await robust_click(target, 'Go')
-        await asyncio.sleep(random.uniform(*AFTER_GO_WAIT))
-
-        links_after = await read_opened_links(page)
-        new_links = links_after[links_before:]
-        opened_tab = len(context.pages) > pages_before
-        logger.info(
-            f"   Go «{title}»: کلیک={'✅' if method else '❌'} | لینک ثبت‌شده: {new_links} "
-            f"| تب جدید: {opened_tab}"
-        )
-        await close_extra_tabs(context, page)
-        await save_shot(page, f'05_go{i+1}_after')
-        await dump_dom(page, f'go{i+1}_after')
-
-        text_after_go = await row_button_text(page, bid)
-        logger.info(f"   متن دکمه بعد از Go: «{text_after_go}»")
-
-        # اگه بعد از چند ثانیه دکمه هنوز Go هست، برگشت از صفحه‌ی بیرونی رو شبیه‌سازی کن
-        simulated = False
-        if method and text_after_go == 'Go':
-            await asyncio.sleep(ROW_CHECK_FIRST)
-            text_wait = await row_button_text(page, bid)
-            logger.info(f"   بعد از {ROW_CHECK_FIRST} ثانیه صبر، متن دکمه: «{text_wait}»")
-            if text_wait == 'Go':
-                logger.info("   🔄 شبیه‌سازی برگشت از صفحه‌ی بیرونی (blur/visibility/focus + رویدادهای تلگرام)")
-                try:
-                    await page.evaluate(SIMULATE_RETURN_JS)
-                    simulated = True
-                except Exception as e:
-                    logger.warning(f"   ⚠️ شبیه‌سازی برگشت ناموفق: {type(e).__name__}")
-                await save_shot(page, f'05_go{i+1}_after_return')
-
-        action_log.append({
-            'action': f'GO_{i+1}',
-            'time': datetime.now().isoformat(),
-            'task': title,
-            'button_id': bid,
-            'links': new_links,
-            'opened_tab': opened_tab,
-            'text_after_go': text_after_go,
-            'simulated_return': simulated,
-            'success': bool(method),
-        })
-        if not method:
-            continue
-
-        # صبر تا متن دکمه از Go به Claim (یا Processing) تغییر کنه
-        claim_btn = None
-        last_text = None
-        start = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start < CLAIM_APPEAR_MAX:
-            last_text = await row_button_text(page, bid)
-            if last_text == 'Claim':
-                claim_btn = page.locator(f'#{bid}').first
-                break
-            await asyncio.sleep(2)
-
-        waited = asyncio.get_event_loop().time() - start
-        if claim_btn is None:
-            logger.warning(f"   ⚠️ بعد از {waited:.0f} ثانیه، Claim برای «{title}» ظاهر نشد (آخرین متن: «{last_text}»)")
-            await save_shot(page, f'06_go{i+1}_no_claim')
-            action_log.append({
-                'action': f'GO_CLAIM_{i+1}',
-                'time': datetime.now().isoformat(),
-                'task': title,
-                'claim_appeared': False,
-                'last_text': last_text,
-                'success': False,
-            })
-            continue
-
-        logger.info(f"   ✅ Claim برای «{title}» بعد از {waited:.0f} ثانیه ظاهر شد")
-        await random_delay(1, 3)
-        await save_shot(page, f'06_go{i+1}_before_claim')
-        claim_method = await robust_click(claim_btn, 'Claim')
-        await asyncio.sleep(4)
-
-        final_text = await row_button_text(page, bid)
-        effect = final_text is not None and final_text != 'Claim'
-        logger.info(
-            f"   Claim «{title}»: کلیک={'✅' if claim_method else '❌'} | متن دکمه الان: «{final_text}» "
-            f"| {'✅ Claim شد' if effect else '❓ هنوز Claim هست'}"
-        )
-        action_log.append({
-            'action': f'GO_CLAIM_{i+1}',
-            'time': datetime.now().isoformat(),
-            'task': title,
-            'claim_appeared': True,
-            'final_text': final_text,
-            'effect_seen': effect,
-            'success': bool(claim_method),
-        })
-        await random_delay(2, 4)
-        await save_shot(page, f'06_go{i+1}_after_claim')
-        await dump_dom(page, f'go{i+1}_after_claim')
-
-
-async def do_mine_page(page, action_log, label):
-    await click_text(page, 'Mine')
-    await random_delay(2, 4)
-    await dump_dom(page, f'mine_{label.lower()}')
-    await tap_coin(page, action_log)
-    await multi_claim(page, action_log)
-    await random_delay(2, 4)
-    await save_shot(page, f'02_{label.lower()}')
-
-
-async def do_tasks(context, page, action_log):
+async def do_tasks(page, action_log):
     ok = await click_text(page, 'Tasks')
     action_log.append({
         'action': 'TASKS_TAB',
@@ -1071,11 +680,92 @@ async def do_tasks(context, page, action_log):
     })
     await random_delay(3, 6)
     await save_shot(page, '03_tasks')
-    await dump_dom(page, 'tasks')
-    await dump_app_functions(page)
 
-    await claim_ready_tasks(page, action_log)
-    await process_go_tasks(context, page, action_log)
+    # وضعیت فعلی همه‌ی تسک‌ها
+    states = {}
+    for task_id, label, _ in TASKS:
+        states[task_id] = await task_text(page, task_id)
+    logger.info(f"📋 وضعیت تسک‌ها: {states}")
+
+    # ۱) Claim های آماده
+    ready = [t for t in TASKS if states.get(t[0]) == 'Claim']
+    random.shuffle(ready)
+    for task_id, label, _ in ready:
+        await claim_task_button(page, task_id, label, action_log)
+        await random_delay(2, 4)
+
+    # ۲) Go های موجود
+    go_tasks = [t for t in TASKS if states.get(t[0]) == 'Go']
+    random.shuffle(go_tasks)
+    started = []
+    for task_id, label, min_sec in go_tasks:
+        logger.info(f"➡️ Go تسک: {label}")
+        await tap_locator(page, task_button(page, task_id), f'Go {task_id}')
+        new_text = await wait_text_change(page, task_id, 'Go', GO_SETTLE_WAIT)
+
+        if new_text == 'Go':
+            logger.info("   ❓ متن عوض نشد، یک بار دیگه تپ می‌زنم")
+            await asyncio.sleep(random.uniform(1, 3))
+            await tap_locator(page, task_button(page, task_id), f'Go {task_id} (تلاش دوم)')
+            new_text = await wait_text_change(page, task_id, 'Go', GO_SETTLE_WAIT)
+
+        links = []
+        try:
+            links = await page.evaluate(
+                "() => (window.__openedLinks || []).map(u => { try { return new URL(u).host } catch (e) { return String(u).slice(0, 40) } })"
+            )
+        except Exception:
+            pass
+        success = new_text in ('Processing', 'Claim')
+        logger.info(f"   {'✅' if success else '❌'} متن دکمه بعد از Go: «{new_text}» | لینک‌های ثبت‌شده: {links}")
+        action_log.append({
+            'action': f'GO_{task_id}',
+            'time': datetime.now().isoformat(),
+            'text_after': new_text,
+            'success': success,
+        })
+        if success:
+            started.append((task_id, label, min_sec))
+        await random_delay(2, 5)
+
+    # ۳) صبر تا Processing تموم بشه و اپ خودش دکمه رو به Claim تبدیل کنه
+    if started:
+        wait_total = max(m for _, _, m in started) + PROCESSING_MARGIN
+        logger.info(f"⏳ صبر تا {wait_total} ثانیه برای تبدیل Processing به Claim...")
+        end = asyncio.get_event_loop().time() + wait_total
+        while asyncio.get_event_loop().time() < end:
+            texts = [await task_text(page, tid) for tid, _, _ in started]
+            if all(t == 'Claim' for t in texts):
+                break
+            await asyncio.sleep(2)
+        await save_shot(page, '04_before_task_claims')
+
+        # ۴) Claim همون تسک‌ها
+        random.shuffle(started)
+        for task_id, label, _ in started:
+            text = await task_text(page, task_id)
+            if text == 'Claim':
+                await claim_task_button(page, task_id, label, action_log)
+                await random_delay(2, 4)
+            else:
+                logger.warning(f"⚠️ «{label}» آماده‌ی Claim نشد (متن: «{text}»)")
+                action_log.append({
+                    'action': f'CLAIM_{task_id}',
+                    'time': datetime.now().isoformat(),
+                    'final_text': text,
+                    'success': False,
+                })
+
+    await save_shot(page, '06_tasks_done')
+
+
+async def do_mine_page(page, action_log, label):
+    await click_text(page, 'Mine')
+    await random_delay(2, 4)
+    await tap_coin(page, action_log)
+    await multi_claim(page, action_log)
+    await random_delay(2, 4)
+    await save_shot(page, f'02_{label.lower()}')
 
 
 async def maybe_wander(page, action_log):
@@ -1093,6 +783,8 @@ async def maybe_wander(page, action_log):
 
 
 async def run_miner(url, action_log):
+    """اجرای کامل داخل اپ. True برمی‌گردونه اگه موقع خروج ONLINE تایید شد."""
+    online_ok = False
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -1104,7 +796,7 @@ async def run_miner(url, action_log):
             is_mobile=True,
             has_touch=True,
         )
-        # شبیه‌سازی openLink تلگرام + ثبت رویدادهای گوش‌داده‌شده، قبل از لود هر صفحه
+        # جلوگیری از باز شدن لینک‌های بیرونی (اپ لینک رو ثبت‌شده می‌بینه)
         await context.add_init_script(INIT_SCRIPT)
         page = await context.new_page()
         attach_diagnostics(page)
@@ -1114,7 +806,6 @@ async def run_miner(url, action_log):
             await page.goto(url, wait_until='networkidle', timeout=60000)
             await random_delay(3, 6)
             await save_shot(page, '01_mine')
-            await dump_dom(page, 'start')
 
             await wait_until_online(page, action_log)
             await click_text(page, 'Mine', timeout=5000)
@@ -1126,19 +817,22 @@ async def run_miner(url, action_log):
             if mine_first:
                 await do_mine_page(page, action_log, 'MINE_1')
                 await maybe_wander(page, action_log)
-                await do_tasks(context, page, action_log)
+                await do_tasks(page, action_log)
                 if random.random() < FINAL_MINE_CLAIM_CHANCE:
                     await do_mine_page(page, action_log, 'MINE_2')
             else:
-                await do_tasks(context, page, action_log)
+                await do_tasks(page, action_log)
                 await maybe_wander(page, action_log)
                 await do_mine_page(page, action_log, 'MINE_1')
 
-            await save_shot(page, '07_final')
+            # آخر کار: مطمئن شو ONLINE هست، بعد خارج شو
+            online_ok = await ensure_online_before_exit(page, action_log)
 
         finally:
             await context.close()
             await browser.close()
+
+    return online_ok
 
 
 async def run_bot():
@@ -1151,6 +845,7 @@ async def run_bot():
 
     action_log = []
     success = False
+    online_ok = True
 
     try:
         await client.connect()
@@ -1171,7 +866,7 @@ async def run_bot():
         webapp_url = await get_webapp_url()
         logger.info("🔗 URL وب‌اپ گرفته شد")
 
-        await run_miner(webapp_url, action_log)
+        online_ok = await run_miner(webapp_url, action_log)
 
         logger.info("✅ چرخه کامل انجام شد")
         success = True
@@ -1183,8 +878,11 @@ async def run_bot():
         logger.error(f"❌ خطای کلی: {type(e).__name__}: {e}")
 
     finally:
-        if success:
+        if success and (online_ok or not RETRY_IF_OFFLINE):
             schedule_next_run()
+        elif success:
+            logger.warning("⚠️ موقع خروج ONLINE نبود؛ اجرای بعدی زودتر زمان‌بندی می‌شه")
+            schedule_retry('offline_retry')
         else:
             schedule_retry()
 
