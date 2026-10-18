@@ -5,6 +5,7 @@ import logging
 import random
 import json
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient
@@ -33,6 +34,9 @@ SESSION_NAME = 'user_session'  # نام فایل session (فقط برای اجر
 # اجرای اجباری (بدون بررسی زمان‌بندی) - برای اجرای دستی
 FORCE_RUN = os.getenv('FORCE_RUN', 'false').strip().lower() == 'true'
 
+# ذخیره‌ی DOM برای دیباگ (با DUMP_DOM=false خاموش می‌شه)
+DUMP_DOM = os.getenv('DUMP_DOM', 'true').strip().lower() != 'false'
+
 BOT_USERNAME = 'ATF_AIRDROP_bot'
 WEBAPP_BASE = 'https://atfminers.asloni.online/miner/index.html'
 APP_HOST = 'atfminers.asloni.online'
@@ -40,33 +44,30 @@ SCREENSHOT_DIR = 'screenshots'
 
 # --- زمان‌بندی: تقریباً هر ساعت ---
 STATE_FILE = 'schedule_state.json'
-MIN_GAP_MIN = 55    # حداقل فاصله بین اجراها (دقیقه)
-MAX_GAP_MIN = 65    # حداکثر فاصله (دقیقه)
-
-# فاصله‌ی تلاش مجدد بعد از شکست (دقیقه)
+MIN_GAP_MIN = 55
+MAX_GAP_MIN = 65
 RETRY_GAP_MIN = (20, 40)
 
 # --- آنلاین شدن اپ ---
-ONLINE_WAIT_MAX = 180         # حداکثر صبر برای ظاهر شدن ONLINE (ثانیه)
-WARMUP_TABS = ['Miners', 'Friends', 'Profile']  # تب‌هایی که توی گشت اولیه می‌گرده
+ONLINE_WAIT_MAX = 180
+WARMUP_TABS = ['Miners', 'Friends', 'Profile']
 
 # --- صفحه‌ی اول (Mine) ---
-COIN_TAPS = (8, 15)           # تعداد تپ روی دایره‌ی ATF در هر اجرا
-COIN_TAP_DELAY = (0.3, 1.2)   # فاصله‌ی بین تپ‌ها (ثانیه)
-CLAIM_CLICKS = (3, 5)         # تعداد کلیک روی CLAIM صفحه‌ی اول در هر اجرا
-CLAIM_CLICK_DELAY = (2, 5)    # فاصله‌ی بین کلیک‌های CLAIM (ثانیه)
+COIN_TAPS = (8, 15)
+COIN_TAP_DELAY = (0.3, 1.2)
+CLAIM_CLICKS = (3, 5)
+CLAIM_CLICK_DELAY = (2, 5)
 
 # --- رفتار نامنظم داخل اپ ---
-START_JITTER = (0, 90)        # تاخیر رندم قبل از شروع (ثانیه)
-WANDER_CHANCE = 0.30          # احتمال سر زدن به یه تب اضافه
-EXTRA_PAUSE_CHANCE = 0.15     # احتمال مکث اضافه بین کارها
-FINAL_MINE_CLAIM_CHANCE = 1.0 # احتمال Mine نهایی بعد از Tasks (وقتی اول Mine رو زده)
+START_JITTER = (0, 90)
+WANDER_CHANCE = 0.30
+EXTRA_PAUSE_CHANCE = 0.15
+FINAL_MINE_CLAIM_CHANCE = 1.0
 WANDER_TABS = ['Miners', 'Friends', 'Profile']
 
-# صبر بعد از Go تا دکمه‌ی Claim تسک فعال بشه (ثانیه، بازه‌ی تصادفی)
-CLAIM_WAIT = (12, 18)
-
-# حداکثر تعداد تسک‌ها برای پردازش
+# --- تسک‌ها ---
+AFTER_GO_WAIT = (4, 8)        # صبر کوتاه بعد از Go (مثل دیدن صفحه‌ی خارجی)
+CLAIM_APPEAR_MAX = 60         # حداکثر صبر برای تبدیل شدن Go به Claim (ثانیه)
 MAX_TASKS = 6
 
 if not API_ID_RAW or not API_HASH:
@@ -89,10 +90,155 @@ else:
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
+# اسکریپتی که قبل از لود اپ تزریق می‌شه: openLink و window.open رو می‌گیره و ثبت می‌کنه
+INIT_SCRIPT = """
+(() => {
+  window.__openedLinks = [];
+  const record = (u) => { try { window.__openedLinks.push(String(u)); } catch (e) {} };
+
+  window.open = function (u) { record(u); return null; };
+
+  const patchWebApp = () => {
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (!tg || tg.__patched) return;
+    tg.__patched = true;
+    try { tg.openLink = function (u) { record(u); }; } catch (e) {}
+    try { tg.openTelegramLink = function (u) { record(u); }; } catch (e) {}
+  };
+
+  patchWebApp();
+  let tries = 0;
+  const iv = setInterval(() => {
+    patchWebApp();
+    if (++tries > 200) clearInterval(iv);
+  }, 50);
+
+  document.addEventListener('click', (ev) => {
+    const a = ev.target && ev.target.closest && ev.target.closest('a[href]');
+    if (a && /^https?:/i.test(a.href) && a.target === '_blank') {
+      record(a.href);
+      ev.preventDefault();
+    }
+  }, true);
+})();
+"""
+
+# --- جاوااسکریپت ذخیره‌ی DOM ---
+
+# HTML صفحه بدون script/noscript و بدون داده‌ی سنگین
+DOM_HTML_JS = """
+() => {
+  const clone = document.documentElement.cloneNode(true);
+  clone.querySelectorAll('script,noscript').forEach((e) => e.remove());
+  clone.querySelectorAll('img[src^="data:"]').forEach((e) => e.setAttribute('src', 'data:(حذف شد)'));
+  clone.querySelectorAll('input,textarea').forEach((e) => e.removeAttribute('value'));
+  return clone.outerHTML;
+}
+"""
+
+# خلاصه‌ی المان‌های کلیک‌پذیر و دکمه‌های Go/Claim/CLAIM/Processing با والدها
+DOM_SUMMARY_JS = """
+() => {
+  const short = (s, n) => (s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
+  const cls = (el) => (typeof el.className === 'string' ? el.className : (el.getAttribute('class') || ''));
+  const desc = (el) => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return {
+      tag: el.tagName.toLowerCase(),
+      id: el.id || '',
+      class: short(cls(el), 80),
+      role: el.getAttribute('role') || '',
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      pe: cs.pointerEvents,
+      cursor: cs.cursor,
+      rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+      text: short(el.innerText, 60),
+    };
+  };
+
+  const out = { clickable: [], actions: [] };
+
+  document.querySelectorAll('button,[role="button"],a,[onclick]').forEach((el) => {
+    out.clickable.push(desc(el));
+  });
+
+  const wanted = /^(go|claim|processing\\.*|checking\\.*|verifying\\.*)$/i;
+  document.querySelectorAll('body *').forEach((el) => {
+    const t = short(el.innerText, 30);
+    if (!wanted.test(t)) return;
+    // فقط عمیق‌ترین المانی که این متن رو داره
+    const deeper = Array.from(el.children).some((c) => wanted.test(short(c.innerText, 30)));
+    if (deeper) return;
+    const chain = [];
+    let cur = el;
+    for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
+      chain.push(desc(cur));
+      cur = cur.parentElement;
+    }
+    out.actions.push({ text: t, chain });
+  });
+
+  out.openedLinks = (window.__openedLinks || []).map((u) => {
+    try { return new URL(u).host; } catch (e) { return String(u).slice(0, 40); }
+  });
+  out.url = location.origin + location.pathname;
+  return out;
+}
+"""
+
+
+def _fmt(d):
+    return (
+        f"<{d['tag']}"
+        f"{' #' + d['id'] if d['id'] else ''}"
+        f"{' .' + d['class'] if d['class'] else ''}"
+        f"{' role=' + d['role'] if d['role'] else ''}>"
+        f" rect={d['rect']} pe={d['pe']} cursor={d['cursor']}"
+        f"{' DISABLED' if d['disabled'] else ''} text=«{d['text']}»"
+    )
+
+
+async def dump_dom(page, name):
+    """ذخیره‌ی HTML (بدون script) و خلاصه‌ی دکمه‌ها برای دیباگ"""
+    if not DUMP_DOM:
+        return
+    try:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+        html = await page.evaluate(DOM_HTML_JS)
+        if len(html) > 600000:
+            html = html[:600000] + '\n<!-- بریده شد -->'
+        with open(os.path.join(SCREENSHOT_DIR, f'dom_{name}.html'), 'w', encoding='utf-8') as f:
+            f.write(html)
+
+        summary = await page.evaluate(DOM_SUMMARY_JS)
+        lines = [
+            f"# DOM خلاصه: {name}",
+            f"# آدرس: {summary.get('url')}",
+            f"# لینک‌های ثبت‌شده (فقط دامنه): {summary.get('openedLinks')}",
+            "",
+            f"## دکمه‌های Go / Claim / Processing ({len(summary['actions'])} مورد)",
+        ]
+        for i, a in enumerate(summary['actions'], 1):
+            lines.append(f"[{i}] متن: {a['text']}")
+            for lvl, d in enumerate(a['chain']):
+                lines.append(f"    {'  ' * lvl}↑{lvl} {_fmt(d)}")
+        lines.append("")
+        lines.append(f"## همه‌ی المان‌های کلیک‌پذیر ({len(summary['clickable'])} مورد)")
+        for d in summary['clickable']:
+            lines.append(f"  {_fmt(d)}")
+
+        with open(os.path.join(SCREENSHOT_DIR, f'dom_{name}.txt'), 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        logger.info(f"🧬 DOM ذخیره شد: dom_{name}")
+    except Exception as e:
+        logger.warning(f"⚠️ ذخیره‌ی DOM ناموفق ({name}): {type(e).__name__}")
+
+
 # ---------- زمان‌بندی ----------
 
 def load_next_run():
-    """خواندن زمان اجرای بعدی از فایل وضعیت (None اگه نبود یا خراب بود)"""
     try:
         with open(STATE_FILE, 'r') as f:
             data = json.load(f)
@@ -102,7 +248,6 @@ def load_next_run():
 
 
 def save_next_run(gap, reason):
-    """ذخیره‌ی زمان اجرای بعدی بعد از gap دقیقه"""
     next_run = datetime.now(TIMEZONE) + timedelta(minutes=gap)
     try:
         with open(STATE_FILE, 'w') as f:
@@ -120,17 +265,14 @@ def save_next_run(gap, reason):
 
 
 def schedule_next_run():
-    """بعد از اجرای موفق: تقریباً یک ساعت بعد"""
     save_next_run(random.randint(MIN_GAP_MIN, MAX_GAP_MIN), 'success')
 
 
 def schedule_retry():
-    """بعد از شکست: تلاش مجدد با فاصله‌ی کوتاه‌تر (ولی نه هر ۱۰ دقیقه)"""
     save_next_run(random.randint(*RETRY_GAP_MIN), 'retry')
 
 
 def is_due():
-    """آیا وقت اجرای بعدی رسیده؟"""
     next_run = load_next_run()
     now = datetime.now(TIMEZONE)
     if next_run is None:
@@ -150,7 +292,6 @@ def is_due():
 # ---------- ابزارها ----------
 
 async def random_delay(min_s=2, max_s=6):
-    """تاخیر تصادفی مثل انسان (گاهی با مکث اضافه)"""
     delay = random.uniform(min_s, max_s)
     if random.random() < EXTRA_PAUSE_CHANCE:
         extra = random.uniform(5, 12)
@@ -168,7 +309,6 @@ async def get_webapp_url():
         access_hash=bot_entity.access_hash,
     )
 
-    # پیدا کردن دکمه‌ی وب‌اپ از پیام /start
     await client.send_message(bot_entity, '/start')
     await asyncio.sleep(4)
     messages = await client.get_messages(bot_entity, limit=10)
@@ -201,7 +341,6 @@ async def get_webapp_url():
 
 
 async def save_shot(page, name):
-    """ذخیره‌ی اسکرین‌شات برای دیباگ"""
     try:
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
@@ -220,7 +359,6 @@ async def robust_click(locator, label=''):
     except Exception:
         pass
 
-    # روش ۱: کلیک عادی
     try:
         await locator.click(timeout=4000)
         logger.info(f"   ↳ [{label}] کلیک عادی انجام شد")
@@ -228,7 +366,6 @@ async def robust_click(locator, label=''):
     except Exception as e:
         logger.info(f"   ↳ [{label}] کلیک عادی ناموفق ({type(e).__name__})")
 
-    # روش ۲: کلیک با مختصات وسط المان
     try:
         box = await locator.bounding_box()
         if box:
@@ -241,7 +378,6 @@ async def robust_click(locator, label=''):
     except Exception as e:
         logger.info(f"   ↳ [{label}] کلیک با مختصات ناموفق ({type(e).__name__})")
 
-    # روش ۳: dispatch_event
     try:
         await locator.dispatch_event('click')
         logger.info(f"   ↳ [{label}] dispatch_event انجام شد")
@@ -253,14 +389,12 @@ async def robust_click(locator, label=''):
 
 
 def clickable_locator(page, text):
-    """دکمه‌های کلیک‌پذیر با متن دقیق؛ اگه نبود get_by_text"""
     pattern = re.compile(rf'^\s*{re.escape(text)}\s*$')
-    primary = page.locator('button, [role="button"], a').filter(has_text=pattern)
-    return primary
+    return page.locator('button, [role="button"], a').filter(has_text=pattern)
 
 
 async def list_buttons(page, text):
-    """لیست دکمه‌های قابل‌دیدن و فعال با متن مشخص (ابتدا کلیک‌پذیرها، بعد get_by_text)"""
+    """لیست دکمه‌های قابل‌دیدن و فعال با متن مشخص"""
     found = []
     for loc in (clickable_locator(page, text), page.get_by_text(text, exact=True)):
         try:
@@ -284,7 +418,6 @@ async def count_buttons(page, text):
 
 
 async def click_text(page, text, timeout=15000):
-    """کلیک روی اولین دکمه‌ی قابل‌دیدن با متن مشخص (با انتظار)"""
     deadline = asyncio.get_event_loop().time() + timeout / 1000
     while True:
         buttons = await list_buttons(page, text)
@@ -300,7 +433,6 @@ async def click_text(page, text, timeout=15000):
 
 
 async def click_visible(page, text, randomize=False):
-    """کلیک روی یکی از دکمه‌های قابل‌دیدن (اولی، یا رندم)"""
     buttons = await list_buttons(page, text)
     if randomize:
         random.shuffle(buttons)
@@ -313,7 +445,6 @@ async def click_visible(page, text, randomize=False):
 
 
 async def close_extra_tabs(context, page):
-    """بستن تب‌های خارجی (یوتیوب، X، سایت) و برگشت به اپ"""
     for extra in list(context.pages):
         if extra != page:
             try:
@@ -322,7 +453,6 @@ async def close_extra_tabs(context, page):
             except Exception:
                 pass
 
-    # اگه صفحه‌ی خود اپ به جای دیگه رفته، برگرد
     if page.url and APP_HOST not in page.url:
         try:
             await page.go_back(timeout=15000)
@@ -341,7 +471,6 @@ async def is_online(page):
 
 
 async def wait_until_online(page, action_log):
-    """گشت بین تب‌ها تا وضعیت ONLINE ظاهر بشه (حداکثر ONLINE_WAIT_MAX ثانیه)"""
     if await is_online(page):
         logger.info("🟢 اپ از قبل ONLINE است")
         return True
@@ -384,7 +513,6 @@ async def wait_until_online(page, action_log):
 # ---------- صفحه‌ی اول: دایره‌ی ATF و CLAIM ----------
 
 async def read_gain(page):
-    """خواندن عدد +x.xxxx بالای دایره (برای تایید اثر تپ و Claim)"""
     try:
         body = await page.inner_text('body', timeout=3000)
         m = re.search(r'\+\s*(\d+(?:\.\d+)?)', body)
@@ -396,7 +524,6 @@ async def read_gain(page):
 
 
 async def find_coin_center(page):
-    """پیدا کردن مرکز دایره‌ی ATF (المان تقریباً مربعی و بزرگ نزدیک مرکز صفحه)"""
     vp = page.viewport_size or {'width': 412, 'height': 915}
     vw, vh = vp['width'], vp['height']
     try:
@@ -440,7 +567,6 @@ async def find_coin_center(page):
 
 
 async def tap_coin(page, action_log):
-    """چند بار تپ روی دایره‌ی ATF و ثبت تغییر عدد بالای دایره"""
     x, y, size = await find_coin_center(page)
     taps = random.randint(*COIN_TAPS)
     spread = max(10, size * 0.12)
@@ -484,7 +610,6 @@ async def tap_coin(page, action_log):
 
 
 async def multi_claim(page, action_log):
-    """چند بار کلیک روی CLAIM صفحه‌ی اول"""
     clicks = random.randint(*CLAIM_CLICKS)
     logger.info(f"🟡 شروع {clicks} کلیک روی CLAIM صفحه‌ی اول")
 
@@ -509,116 +634,209 @@ async def multi_claim(page, action_log):
     return done
 
 
-# ---------- تسک‌ها ----------
+# ---------- تسک‌ها (ردیف‌محور) ----------
+
+# پیدا کردن کارت ردیف از روی دکمه: بالاترین والدی که فقط یک دکمه‌ی Go/Claim داره
+ROW_JS = """
+(btn) => {
+  const isAction = (el) => {
+    const t = (el.innerText || '').trim();
+    return t === 'Go' || t === 'Claim';
+  };
+  let row = btn;
+  let cur = btn.parentElement;
+  while (cur && cur !== document.body) {
+    const actions = Array.from(cur.querySelectorAll('button,[role="button"],a,div,span'))
+      .filter((e) => e.children.length === 0 && isAction(e));
+    if (actions.length > 1) break;
+    row = cur;
+    cur = cur.parentElement;
+  }
+  return row;
+}
+"""
+
+
+async def row_title(btn):
+    """عنوان کارت تسک (چند کلمه‌ی اول متن ردیف) برای شناسایی ردیف بعد از تغییر"""
+    try:
+        handle = await btn.evaluate_handle(ROW_JS)
+        text = await handle.evaluate("(el) => (el.innerText || '').trim()")
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        lines = [l for l in lines if l not in ('Go', 'Claim')]
+        return ' '.join(lines[:2])[:60]
+    except Exception:
+        return ''
+
+
+async def find_row_button(page, title, text):
+    """دکمه‌ای با متن مشخص (Go/Claim) داخل ردیفی که عنوانش title هست"""
+    if not title:
+        return None
+    for btn in await list_buttons(page, text):
+        if await row_title(btn) == title:
+            return btn
+    return None
+
+
+async def read_opened_links(page):
+    try:
+        links = await page.evaluate("() => window.__openedLinks || []")
+    except Exception:
+        return []
+    out = []
+    for u in links:
+        try:
+            out.append(urlparse(u).netloc or u[:40])
+        except Exception:
+            out.append(str(u)[:40])
+    return out
+
 
 async def claim_ready_tasks(page, action_log):
-    """کلیک روی همه‌ی Claim های آماده‌ی تسک‌ها با تایید اثر (کم شدن تعداد Claim)"""
+    """Claim همه‌ی تسک‌های آماده؛ موفقیت = ناپدید شدن دکمه‌ی Claim همون ردیف"""
     claimed = 0
+    seen_titles = set()
     for n in range(MAX_TASKS):
-        before = await count_buttons(page, 'Claim')
-        logger.info(f"🔎 تعداد دکمه‌ی Claim تسک (قابل‌کلیک): {before}")
-        if before == 0:
+        buttons = await list_buttons(page, 'Claim')
+        target = None
+        title = ''
+        for b in buttons:
+            t = await row_title(b)
+            if t not in seen_titles:
+                target, title = b, t
+                break
+        if target is None:
             break
 
+        seen_titles.add(title)
+        logger.info(f"🔎 Claim تسک: «{title}»")
         await save_shot(page, f'04_claim{n+1}_before')
-        ok = await click_visible(page, 'Claim', randomize=False)
-        await asyncio.sleep(3)
-        after = await count_buttons(page, 'Claim')
-        effect = after < before
+        await dump_dom(page, f'claim{n+1}_before')
+        method = await robust_click(target, 'Claim')
+        await asyncio.sleep(4)
+
+        still = await find_row_button(page, title, 'Claim')
+        effect = still is None
         logger.info(
-            f"   Claim {n+1}: کلیک={'✅' if ok else '❌'} | تعداد قبل: {before} ← بعد: {after} "
-            f"| {'✅ اثر داشت' if effect else '❓ اثری دیده نشد'}"
+            f"   Claim «{title}»: کلیک={'✅' if method else '❌'} "
+            f"| {'✅ Claim شد (دکمه ناپدید شد)' if effect else '❓ هنوز Claim هست'}"
         )
         action_log.append({
             'action': f'READY_CLAIM_{n+1}',
             'time': datetime.now().isoformat(),
-            'before': before,
-            'after': after,
+            'task': title,
             'effect_seen': effect,
-            'success': ok,
+            'success': bool(method),
         })
         await save_shot(page, f'04_claim{n+1}_after')
-
-        if not ok:
-            break
+        await dump_dom(page, f'claim{n+1}_after')
         if effect:
             claimed += 1
-        else:
-            # اثر نداشت؛ احتمالاً دکمه‌ی دیگه‌ای هست یا اپ قبول نکرده. یه بار دیگه سعی نکن.
-            break
+        await random_delay(2, 4)
 
-        await random_delay(3, 5)
-
-    logger.info(f"🎯 تعداد Claim های موفق (با اثر): {claimed}")
+    logger.info(f"🎯 تعداد Claim های موفق: {claimed}")
     return claimed
 
 
 async def process_go_tasks(context, page, action_log):
-    """تسک‌هایی که هنوز Go دارن: Go ← بررسی تب جدید ← برگشت ← صبر ← Claim"""
-    go_count = await count_buttons(page, 'Go')
-    logger.info(f"📋 تعداد دکمه‌ی Go (قابل‌کلیک): {go_count}")
+    """هر Go: کلیک ← ثبت لینک باز شده ← صبر ← تبدیل به Claim (Processing) ← Claim همون ردیف"""
+    done_titles = set()
+    for i in range(MAX_TASKS):
+        target = None
+        title = ''
+        for b in await list_buttons(page, 'Go'):
+            t = await row_title(b)
+            if t not in done_titles:
+                target, title = b, t
+                break
+        if target is None:
+            break
 
-    for i in range(min(go_count, MAX_TASKS)):
-        logger.info(f"📋 پردازش تسک Go شماره {i+1}")
-        pages_before = len(context.pages)
-        url_before = page.url
+        done_titles.add(title)
+        logger.info(f"📋 تسک Go شماره {i+1}: «{title}»")
         await save_shot(page, f'05_go{i+1}_before')
+        await dump_dom(page, f'go{i+1}_before')
 
-        go_ok = await click_visible(page, 'Go', randomize=True)
-        await asyncio.sleep(3)
+        links_before = len(await read_opened_links(page))
+        pages_before = len(context.pages)
+        method = await robust_click(target, 'Go')
+        await asyncio.sleep(random.uniform(*AFTER_GO_WAIT))
 
+        links_after = await read_opened_links(page)
+        new_links = links_after[links_before:]
         opened_tab = len(context.pages) > pages_before
-        url_changed = page.url != url_before
-        effect = opened_tab or url_changed
         logger.info(
-            f"   Go {i+1}: کلیک={'✅' if go_ok else '❌'} | تب جدید: {opened_tab} "
-            f"| تغییر آدرس: {url_changed} | {'✅ اثر داشت' if effect else '❓ اثری دیده نشد'}"
+            f"   Go «{title}»: کلیک={'✅' if method else '❌'} | لینک ثبت‌شده: {new_links} "
+            f"| تب جدید: {opened_tab}"
         )
         action_log.append({
             'action': f'GO_{i+1}',
             'time': datetime.now().isoformat(),
+            'task': title,
+            'links': new_links,
             'opened_tab': opened_tab,
-            'url_changed': url_changed,
-            'success': go_ok,
+            'success': bool(method),
         })
-        if not go_ok:
-            break
+        if not method:
+            continue
 
-        # چند ثانیه روی صفحه‌ی خارجی، بعد بستن و برگشت
-        await random_delay(4, 7)
         await close_extra_tabs(context, page)
+        await save_shot(page, f'05_go{i+1}_after')
+        await dump_dom(page, f'go{i+1}_after')
 
-        # صبر تا دکمه‌ی Claim تسک فعال بشه
-        await random_delay(*CLAIM_WAIT)
-        await save_shot(page, f'05_go{i+1}_before_claim')
+        # صبر تا Go همون ردیف ناپدید و Claim همون ردیف ظاهر بشه (Processing بینش هست)
+        claim_btn = None
+        start = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start < CLAIM_APPEAR_MAX:
+            claim_btn = await find_row_button(page, title, 'Claim')
+            if claim_btn is not None:
+                break
+            await asyncio.sleep(2)
 
-        claims_before = await count_buttons(page, 'Claim')
-        claim_ok = await click_visible(page, 'Claim', randomize=False)
-        await asyncio.sleep(3)
-        claims_after = await count_buttons(page, 'Claim')
-        claim_effect = claims_after < claims_before
+        waited = asyncio.get_event_loop().time() - start
+        if claim_btn is None:
+            logger.warning(f"   ⚠️ بعد از {waited:.0f} ثانیه، Claim برای «{title}» ظاهر نشد")
+            await save_shot(page, f'06_go{i+1}_no_claim')
+            await dump_dom(page, f'go{i+1}_no_claim')
+            action_log.append({
+                'action': f'GO_CLAIM_{i+1}',
+                'time': datetime.now().isoformat(),
+                'task': title,
+                'claim_appeared': False,
+                'success': False,
+            })
+            continue
+
+        logger.info(f"   ✅ Claim برای «{title}» بعد از {waited:.0f} ثانیه ظاهر شد")
+        await random_delay(1, 3)
+        await save_shot(page, f'06_go{i+1}_before_claim')
+        claim_method = await robust_click(claim_btn, 'Claim')
+        await asyncio.sleep(4)
+
+        still = await find_row_button(page, title, 'Claim')
+        effect = still is None
         logger.info(
-            f"   Claim بعد از Go {i+1}: کلیک={'✅' if claim_ok else '❌'} "
-            f"| قبل: {claims_before} ← بعد: {claims_after} "
-            f"| {'✅ اثر داشت' if claim_effect else '❓ اثری دیده نشد'}"
+            f"   Claim «{title}»: کلیک={'✅' if claim_method else '❌'} "
+            f"| {'✅ Claim شد' if effect else '❓ هنوز Claim هست'}"
         )
         action_log.append({
             'action': f'GO_CLAIM_{i+1}',
             'time': datetime.now().isoformat(),
-            'before': claims_before,
-            'after': claims_after,
-            'effect_seen': claim_effect,
-            'success': claim_ok,
+            'task': title,
+            'claim_appeared': True,
+            'effect_seen': effect,
+            'success': bool(claim_method),
         })
-
         await random_delay(2, 4)
         await save_shot(page, f'06_go{i+1}_after_claim')
+        await dump_dom(page, f'go{i+1}_after_claim')
 
 
 async def do_mine_page(page, action_log, label):
-    """رفتن به تب Mine، چند تپ روی دایره‌ی ATF و چند کلیک روی CLAIM"""
     await click_text(page, 'Mine')
     await random_delay(2, 4)
+    await dump_dom(page, f'mine_{label.lower()}')
     await tap_coin(page, action_log)
     await multi_claim(page, action_log)
     await random_delay(2, 4)
@@ -626,7 +844,6 @@ async def do_mine_page(page, action_log, label):
 
 
 async def do_tasks(context, page, action_log):
-    """رفتن به تب Tasks و انجام Claim ها و Go ها"""
     ok = await click_text(page, 'Tasks')
     action_log.append({
         'action': 'TASKS_TAB',
@@ -635,14 +852,13 @@ async def do_tasks(context, page, action_log):
     })
     await random_delay(3, 6)
     await save_shot(page, '03_tasks')
+    await dump_dom(page, 'tasks')
 
-    # اول Claim های آماده، بعد تسک‌هایی که هنوز Go دارن
     await claim_ready_tasks(page, action_log)
     await process_go_tasks(context, page, action_log)
 
 
 async def maybe_wander(page, action_log):
-    """گاهی یه تب اضافه رو باز کن و برگرد (رفتار طبیعی‌تر)"""
     if random.random() >= WANDER_CHANCE:
         return
     tab = random.choice(WANDER_TABS)
@@ -657,7 +873,6 @@ async def maybe_wander(page, action_log):
 
 
 async def run_miner(url, action_log):
-    """باز کردن وب‌اپ با مرورگر و انجام Mine و Tasks (با ترتیب رندم)"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -669,6 +884,8 @@ async def run_miner(url, action_log):
             is_mobile=True,
             has_touch=True,
         )
+        # شبیه‌سازی openLink تلگرام قبل از لود هر صفحه
+        await context.add_init_script(INIT_SCRIPT)
         page = await context.new_page()
 
         try:
@@ -676,8 +893,8 @@ async def run_miner(url, action_log):
             await page.goto(url, wait_until='networkidle', timeout=60000)
             await random_delay(3, 6)
             await save_shot(page, '01_mine')
+            await dump_dom(page, 'start')
 
-            # صبر تا اپ ONLINE بشه (گشت اولیه)
             await wait_until_online(page, action_log)
             await click_text(page, 'Mine', timeout=5000)
             await random_delay(2, 4)
@@ -704,10 +921,8 @@ async def run_miner(url, action_log):
 
 
 async def run_bot():
-    """تابع اصلی اجرای ربات"""
     logger.info("🚀 شروع ربات...")
 
-    # بررسی زمان‌بندی قبل از هر کاری (بدون اتصال به تلگرام)
     if FORCE_RUN:
         logger.info("⚡ اجرای دستی: زمان‌بندی نادیده گرفته شد")
     elif not is_due():
@@ -729,15 +944,12 @@ async def run_bot():
 
         logger.info("✅ متصل شد به تلگرام")
 
-        # تاخیر رندم قبل از شروع (توی اجرای دستی رد می‌شه)
         if not FORCE_RUN:
             await random_delay(*START_JITTER)
 
-        # گرفتن URL احراز هویت‌شده
         webapp_url = await get_webapp_url()
         logger.info("🔗 URL وب‌اپ گرفته شد")
 
-        # اجرای مرورگر
         await run_miner(webapp_url, action_log)
 
         logger.info("✅ چرخه کامل انجام شد")
@@ -750,7 +962,6 @@ async def run_bot():
         logger.error(f"❌ خطای کلی: {type(e).__name__}: {e}")
 
     finally:
-        # همیشه یه زمان بعدی ذخیره کن تا فایل وضعیت ساخته بشه و تلاش پشت‌سرهم نشه
         if success:
             schedule_next_run()
         else:
