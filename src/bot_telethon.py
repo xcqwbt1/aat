@@ -4,9 +4,8 @@ import asyncio
 import logging
 import random
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
-from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -19,11 +18,19 @@ from telethon.tl.types import (
 )
 from playwright.async_api import async_playwright
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- لاگ ---
+# پیش‌فرض: فقط خلاصه‌ی بی‌نام (برای لاگ عمومی). با VERBOSE_LOG=true جزئیات هم چاپ می‌شه.
+VERBOSE = os.getenv('VERBOSE_LOG', 'false').strip().lower() == 'true'
+SAVE_SHOTS = os.getenv('SAVE_SHOTS', 'false').strip().lower() == 'true'
 
-# منطقه‌ی زمانی
-TIMEZONE = ZoneInfo('Asia/Tehran')
+logging.basicConfig(level=logging.INFO if VERBOSE else logging.WARNING, format='%(message)s')
+logging.getLogger('telethon').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)   # جزئیات (فقط وقتی VERBOSE_LOG=true)
+pub = logging.getLogger('run')         # خلاصه‌ی بی‌نام (همیشه)
+pub.setLevel(logging.INFO)
+
+# زمان‌ها همه UTC هستن (چیزی درباره‌ی منطقه‌ی زمانی لو نمی‌ره)
+TIMEZONE = timezone.utc
 
 # خواندن از Environment Variables
 API_ID_RAW = os.getenv('API_ID')
@@ -66,6 +73,7 @@ WANDER_TABS = ['Miners', 'Friends', 'Profile']
 
 # --- تسک‌ها: (id دکمه بدون btn-، برچسب، حداقل ثانیه‌ی Processing طبق کد اپ) ---
 TASKS = [
+    ('ig_like_comment', 'Instagram Like & Comment', 30),
     ('youtube_like_comment', 'YouTube Like & Comment', 30),
     ('twitter_retweet', 'X Retweet', 30),
     ('website_visit', 'Visit Website', 10),
@@ -77,11 +85,17 @@ GO_SETTLE_WAIT = 6        # صبر بعد از تپ Go تا متن دکمه عو
 PROCESSING_MARGIN = 15    # حاشیه‌ی اضافه روی minSeconds برای ظاهر شدن Claim (ثانیه)
 CLAIM_RESULT_WAIT = 30    # حداکثر صبر برای نتیجه‌ی Claim (ثانیه)
 
-# درخواست‌های سرور که لاگ می‌شن
+# --- پنجره‌های روی صفحه (مثل پنجره‌ی ارتقای سطح) ---
+# فقط دکمه‌هایی با این متن زده می‌شن (بی‌خطر: بستن)
+SAFE_CLOSE_RE = re.compile(r'^\s*(cancel|close|×|✕|x|not now|later|skip|no thanks|maybe later)\s*$', re.I)
+# دکمه‌هایی با این کلمات هرگز زده نمی‌شن (ممکنه موجودی خرج کنن)
+DANGEROUS_RE = re.compile(r'buy|level\s*up|upgrade|confirm|withdraw|submit|claim|verify|swap|pay|send', re.I)
+
+# درخواست‌های سرور که (در حالت VERBOSE) لاگ می‌شن
 TASK_ACTIONS = {'start_task', 'claim_task', 'bio_task_claim', 'name_eye_task_claim'}
 
 if not API_ID_RAW or not API_HASH:
-    raise SystemExit("❌ API_ID یا API_HASH تنظیم نشده (توی Secrets و env چک کن)")
+    raise SystemExit("تنظیمات ناقص است (secret ها را بررسی کن)")
 
 API_ID = int(API_ID_RAW)
 
@@ -92,11 +106,11 @@ if SESSION_STRING:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     except Exception as e:
         raise SystemExit(
-            f"❌ مقدار TELEGRAM_SESSION خراب یا ناقصه ({type(e).__name__}). "
-            "دوباره StringSession بساز و کامل (بدون فاصله/خط اضافه) توی secret بذار."
+            f"مقدار سشن خراب یا ناقصه ({type(e).__name__}). "
+            "دوباره بساز و کامل (بدون فاصله/خط اضافه) توی secret بذار."
         )
 else:
-    logger.info("📁 TELEGRAM_SESSION خالیه، استفاده از فایل session")
+    logger.info("📁 سشن خالیه، استفاده از فایل session")
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
@@ -133,13 +147,49 @@ INIT_SCRIPT = """
 })();
 """
 
+# پنجره‌های فعال و تمام‌صفحه
+OVERLAYS_JS = """
+() => {
+  const out = [];
+  document.querySelectorAll('.modal-overlay').forEach((el) => {
+    const cs = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    const shown = el.classList.contains('active') && cs.display !== 'none' &&
+                  cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    if (shown) out.push(el.id || '');
+  });
+  return out;
+}
+"""
+
+# دکمه‌های داخل یه پنجره
+OVERLAY_BUTTONS_JS = """
+(id) => {
+  const el = id ? document.getElementById(id) : null;
+  if (!el) return [];
+  const out = [];
+  el.querySelectorAll('button,[role="button"],.lvlx-close,.modal-close').forEach((b) => {
+    const r = b.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return;
+    out.push({
+      id: b.id || '',
+      cls: String(b.className || '').slice(0, 60),
+      text: (b.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 40),
+      x: r.x + r.width / 2,
+      y: r.y + r.height / 2,
+    });
+  });
+  return out;
+}
+"""
+
 
 def redact(s):
     return re.sub(r'[A-Za-z0-9_\-]{40,}', '<redacted>', s or '')
 
 
 def attach_diagnostics(page):
-    """لاگ خطاهای صفحه و درخواست‌های تسک (اکشن + status + خلاصه‌ی کوتاه جواب)"""
+    """(فقط VERBOSE) لاگ خطاهای صفحه و درخواست‌های تسک"""
 
     def action_of(url):
         try:
@@ -149,7 +199,7 @@ def attach_diagnostics(page):
 
     async def on_response(resp):
         try:
-            if 'index.php' not in resp.url:
+            if not VERBOSE or 'index.php' not in resp.url:
                 return
             action = action_of(resp.url)
             if action not in TASK_ACTIONS:
@@ -161,6 +211,15 @@ def attach_diagnostics(page):
 
     page.on('response', lambda r: asyncio.ensure_future(on_response(r)))
     page.on('pageerror', lambda e: logger.info(f"💥 pageerror: {redact(str(e))[:160]}"))
+
+
+def summarize(action_log):
+    """خلاصه‌ی بی‌نام نتیجه‌ی اجرا برای لاگ عمومی"""
+    taps = sum(e.get('count', 0) for e in action_log if e.get('action') == 'COIN_TAPS')
+    mine = sum(e.get('count', 0) for e in action_log if e.get('action') == 'MINE_CLAIMS')
+    ok = sum(1 for e in action_log if str(e.get('action', '')).startswith('CLAIM_') and e.get('success'))
+    bad = sum(1 for e in action_log if str(e.get('action', '')).startswith('CLAIM_') and not e.get('success'))
+    return f"summary: taps={taps}, main_claims={mine}, item_claims_ok={ok}, item_claims_failed={bad}"
 
 
 # ---------- زمان‌بندی ----------
@@ -184,15 +243,12 @@ def save_next_run(gap, reason):
                 'reason': reason,
             }, f, indent=2)
     except Exception as e:
-        logger.warning(f"⚠️ ذخیره‌ی زمان‌بندی ناموفق: {e}")
-    logger.info(
-        f"📅 اجرای بعدی ({reason}): {next_run.strftime('%Y-%m-%d %H:%M')} تهران "
-        f"(بعد از {gap // 60} ساعت و {gap % 60} دقیقه)"
-    )
+        logger.info(f"⚠️ ذخیره‌ی زمان‌بندی ناموفق: {e}")
+    pub.info(f"next run in ~{gap} min ({reason})")
 
 
 def schedule_next_run():
-    save_next_run(random.randint(MIN_GAP_MIN, MAX_GAP_MIN), 'success')
+    save_next_run(random.randint(MIN_GAP_MIN, MAX_GAP_MIN), 'ok')
 
 
 def schedule_retry(reason='retry'):
@@ -209,10 +265,7 @@ def is_due():
         logger.info("✅ وقت اجرا رسیده")
         return True
     remaining = int((next_run - now).total_seconds() // 60)
-    logger.info(
-        f"⏰ هنوز وقتش نشده. اجرای بعدی: {next_run.strftime('%H:%M')} تهران "
-        f"({remaining} دقیقه‌ی دیگه)"
-    )
+    pub.info(f"skip: not due ({remaining} min left)")
     return False
 
 
@@ -256,7 +309,7 @@ async def get_webapp_url():
 
     if not button_url:
         button_url = WEBAPP_BASE
-        logger.warning("⚠️ دکمه‌ی وب‌اپ توی پیام پیدا نشد، استفاده از آدرس ثابت")
+        logger.info("⚠️ دکمه‌ی وب‌اپ توی پیام پیدا نشد، استفاده از آدرس ثابت")
 
     result = await client(RequestWebViewRequest(
         peer=input_user,
@@ -268,19 +321,96 @@ async def get_webapp_url():
 
 
 async def save_shot(page, name):
+    """اسکرین‌شات فقط وقتی SAVE_SHOTS=true باشه"""
+    if not SAVE_SHOTS:
+        return
     try:
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
         await page.screenshot(path=path, full_page=False)
         logger.info(f"📸 اسکرین‌شات: {path}")
     except Exception as e:
-        logger.warning(f"⚠️ اسکرین‌شات ذخیره نشد: {e}")
+        logger.info(f"⚠️ اسکرین‌شات ذخیره نشد: {type(e).__name__}")
+
+
+# ---------- پنجره‌های روی صفحه ----------
+
+async def active_overlays(page):
+    try:
+        return await page.evaluate(OVERLAYS_JS)
+    except Exception:
+        return []
+
+
+async def clear_overlays(page, reason=''):
+    """پنجره‌های تمام‌صفحه (مثل ارتقای سطح) رو فقط با دکمه‌ی بی‌خطر (Cancel/Close/×) می‌بنده.
+    True برمی‌گردونه اگه الان هیچ پنجره‌ی فعالی نیست."""
+    closed_any = False
+    for attempt in range(4):
+        overlays = await active_overlays(page)
+        if not overlays:
+            if closed_any:
+                pub.info("overlay closed")
+            return True
+
+        for ov_id in overlays:
+            closed = False
+            try:
+                buttons = await page.evaluate(OVERLAY_BUTTONS_JS, ov_id)
+            except Exception:
+                buttons = []
+
+            for b in buttons:
+                text = b.get('text', '')
+                if DANGEROUS_RE.search(text):
+                    continue
+                is_safe = (
+                    SAFE_CLOSE_RE.match(text) is not None
+                    or b.get('id') == 'minerInfoCancelBtn'
+                    or 'lvlx-close' in b.get('cls', '')
+                )
+                if not is_safe:
+                    continue
+                try:
+                    await page.touchscreen.tap(b['x'], b['y'])
+                    logger.info(f"🧹 [{reason}] بستن پنجره‌ی «{ov_id}» با دکمه‌ی «{text or b.get('cls')}»")
+                    closed = True
+                    break
+                except Exception as e:
+                    logger.info(f"🧹 تپ روی دکمه‌ی بستن ناموفق ({type(e).__name__})")
+
+            if not closed and ov_id == 'minerInfoModal':
+                try:
+                    await page.evaluate("() => { if (typeof closeMinerInfo === 'function') closeMinerInfo(); }")
+                    logger.info(f"🧹 [{reason}] بستن «{ov_id}» با closeMinerInfo()")
+                    closed = True
+                except Exception:
+                    pass
+
+            if closed:
+                closed_any = True
+                await asyncio.sleep(1.2)
+            else:
+                logger.info(f"🧹 پنجره‌ی «{ov_id}» دکمه‌ی بستن بی‌خطر نداشت؛ دست نمی‌زنم")
+
+    remaining = await active_overlays(page)
+    if remaining:
+        pub.info("overlay stuck")
+        logger.info(f"🧹 هنوز فعال: {remaining}")
+        return False
+    if closed_any:
+        pub.info("overlay closed")
+    return True
 
 
 # ---------- کلیک ----------
 
 async def robust_click(locator, label=''):
     """کلیک با سه روش پشت‌سرهم: عادی، با مختصات، dispatch_event (برای تب‌ها و Mine)"""
+    try:
+        await clear_overlays(locator.page, label)
+    except Exception:
+        pass
     try:
         await locator.scroll_into_view_if_needed(timeout=3000)
     except Exception:
@@ -317,6 +447,10 @@ async def robust_click(locator, label=''):
 
 async def tap_locator(page, locator, label=''):
     """تپ لمسی وسط المان (اپ به کلیک ماوس روی دکمه‌های تسک واکنش نشون نمی‌ده)"""
+    try:
+        await clear_overlays(page, label)
+    except Exception:
+        pass
     try:
         await locator.scroll_into_view_if_needed(timeout=3000)
     except Exception:
@@ -368,6 +502,10 @@ async def list_buttons(page, text):
 async def click_text(page, text, timeout=15000):
     deadline = asyncio.get_event_loop().time() + timeout / 1000
     while True:
+        try:
+            await clear_overlays(page, text)
+        except Exception:
+            pass
         buttons = await list_buttons(page, text)
         if buttons:
             method = await robust_click(buttons[0], text)
@@ -375,7 +513,7 @@ async def click_text(page, text, timeout=15000):
                 logger.info(f"✅ کلیک شد: {text} (روش: {method})")
                 return True
         if asyncio.get_event_loop().time() >= deadline:
-            logger.warning(f"⚠️ دکمه‌ی '{text}' پیدا یا کلیک نشد")
+            logger.info(f"⚠️ دکمه‌ی '{text}' پیدا یا کلیک نشد")
             return False
         await asyncio.sleep(1)
 
@@ -383,7 +521,7 @@ async def click_text(page, text, timeout=15000):
 # ---------- آنلاین شدن ----------
 
 async def read_status(page):
-    """متن وضعیت اپ (ONLINE یا هر چیز دیگه) از المنت #miningStatusHeader؛ None اگه پیدا نشد"""
+    """متن وضعیت اپ از المنت #miningStatusHeader؛ None اگه پیدا نشد"""
     try:
         loc = page.locator('#miningStatusHeader')
         if await loc.count() == 0:
@@ -431,7 +569,7 @@ async def browse_for_online(page, max_seconds, label):
 async def wait_until_online(page, action_log):
     """اول کار: صبر تا ONLINE بشه"""
     if await is_online(page):
-        logger.info("🟢 اپ از قبل ONLINE است")
+        pub.info("start status: ok")
         return True
 
     logger.info("🕐 اپ هنوز ONLINE نیست، شروع گشت اولیه...")
@@ -439,10 +577,8 @@ async def wait_until_online(page, action_log):
     ok = await browse_for_online(page, ONLINE_WAIT_MAX, 'شروع')
     elapsed = asyncio.get_event_loop().time() - start
 
-    if ok:
-        logger.info(f"🟢 اپ ONLINE شد (بعد از {elapsed:.0f} ثانیه)")
-    else:
-        logger.warning("⚠️ تا سقف زمان، ONLINE ظاهر نشد؛ ادامه با هشدار")
+    pub.info(f"start status: {'ok' if ok else 'not ok'} (after {elapsed:.0f}s)")
+    if not ok:
         await save_shot(page, '01b_not_online')
 
     action_log.append({
@@ -466,12 +602,13 @@ async def ensure_online_before_exit(page, action_log):
     status = await read_status(page)
 
     if ok:
-        logger.info(f"🟢 قبل از خروج، وضعیت ONLINE تایید شد (وضعیت: {status})")
         await asyncio.sleep(random.uniform(4, 8))
         await save_shot(page, '07_final')
     else:
-        logger.warning(f"⚠️ قبل از خروج هم ONLINE نشد (وضعیت: {status})")
         await save_shot(page, '07_final_not_online')
+
+    pub.info(f"final status: {'ok' if ok else 'not ok'}")
+    logger.info(f"   وضعیت متنی: {status} | {elapsed:.0f} ثانیه")
 
     action_log.append({
         'action': 'FINAL_ONLINE_CHECK',
@@ -521,7 +658,7 @@ async def find_coin_center(page):
             }"""
         )
     except Exception as e:
-        logger.warning(f"⚠️ جستجوی دایره ناموفق: {type(e).__name__}")
+        logger.info(f"⚠️ جستجوی دایره ناموفق: {type(e).__name__}")
         candidates = []
 
     good = [
@@ -535,11 +672,12 @@ async def find_coin_center(page):
         return c['x'], c['y'], min(c['w'], 300)
 
     fx, fy = vw * 0.5, vh * 0.52
-    logger.warning(f"⚠️ دایره پیدا نشد، استفاده از نقطه‌ی تقریبی ({fx:.0f}, {fy:.0f})")
+    logger.info(f"⚠️ دایره پیدا نشد، استفاده از نقطه‌ی تقریبی ({fx:.0f}, {fy:.0f})")
     return fx, fy, 200
 
 
 async def tap_coin(page, action_log):
+    await clear_overlays(page, 'coin')
     x, y, size = await find_coin_center(page)
     taps = random.randint(*COIN_TAPS)
     spread = max(10, size * 0.12)
@@ -556,7 +694,7 @@ async def tap_coin(page, action_log):
             try:
                 await page.mouse.click(tx, ty)
             except Exception as e:
-                logger.warning(f"⚠️ تپ {i+1} ناموفق: {type(e).__name__}")
+                logger.info(f"⚠️ تپ {i+1} ناموفق: {type(e).__name__}")
                 continue
         done += 1
         await asyncio.sleep(random.uniform(*COIN_TAP_DELAY))
@@ -572,8 +710,6 @@ async def tap_coin(page, action_log):
         'action': 'COIN_TAPS',
         'time': datetime.now().isoformat(),
         'count': done,
-        'gain_before': before,
-        'gain_after': after,
         'effect_seen': changed,
         'success': done > 0,
     })
@@ -679,6 +815,7 @@ async def do_tasks(page, action_log):
         'success': ok,
     })
     await random_delay(3, 6)
+    await clear_overlays(page, 'tasks')
     await save_shot(page, '03_tasks')
 
     # وضعیت فعلی همه‌ی تسک‌ها
@@ -748,7 +885,7 @@ async def do_tasks(page, action_log):
                 await claim_task_button(page, task_id, label, action_log)
                 await random_delay(2, 4)
             else:
-                logger.warning(f"⚠️ «{label}» آماده‌ی Claim نشد (متن: «{text}»)")
+                logger.info(f"⚠️ «{label}» آماده‌ی Claim نشد (متن: «{text}»)")
                 action_log.append({
                     'action': f'CLAIM_{task_id}',
                     'time': datetime.now().isoformat(),
@@ -802,12 +939,16 @@ async def run_miner(url, action_log):
         attach_diagnostics(page)
 
         try:
-            logger.info("🌐 باز کردن وب‌اپ...")
             await page.goto(url, wait_until='networkidle', timeout=60000)
+            pub.info("app opened")
             await random_delay(3, 6)
+
+            # پنجره‌ی ارتقای سطح موقع لود باز می‌شه و همه‌چیز رو می‌پوشونه
+            await clear_overlays(page, 'load')
             await save_shot(page, '01_mine')
 
             await wait_until_online(page, action_log)
+            await clear_overlays(page, 'online')
             await click_text(page, 'Mine', timeout=5000)
             await random_delay(2, 4)
 
@@ -825,6 +966,8 @@ async def run_miner(url, action_log):
                 await maybe_wander(page, action_log)
                 await do_mine_page(page, action_log, 'MINE_1')
 
+            pub.info(summarize(action_log))
+
             # آخر کار: مطمئن شو ONLINE هست، بعد خارج شو
             online_ok = await ensure_online_before_exit(page, action_log)
 
@@ -836,10 +979,10 @@ async def run_miner(url, action_log):
 
 
 async def run_bot():
-    logger.info("🚀 شروع ربات...")
+    pub.info("job start")
 
     if FORCE_RUN:
-        logger.info("⚡ اجرای دستی: زمان‌بندی نادیده گرفته شد")
+        pub.info("manual run")
     elif not is_due():
         return
 
@@ -851,38 +994,34 @@ async def run_bot():
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("❌ Session معتبر نیست!")
-            if SESSION_STRING:
-                logger.info("💡 مقدار secret به اسم TELEGRAM_SESSION باطل یا ناقصه؛ با همون API_ID/API_HASH دوباره بسازش")
-            else:
-                logger.info("💡 secret به اسم TELEGRAM_SESSION به ربات نرسیده یا خالیه، یا فایل user_session.session لاگین نیست")
+            pub.error("session invalid")
             return
 
-        logger.info("✅ متصل شد به تلگرام")
+        pub.info("connected")
 
         if not FORCE_RUN:
             await random_delay(*START_JITTER)
 
         webapp_url = await get_webapp_url()
-        logger.info("🔗 URL وب‌اپ گرفته شد")
 
         online_ok = await run_miner(webapp_url, action_log)
 
-        logger.info("✅ چرخه کامل انجام شد")
+        pub.info("cycle done")
         success = True
 
     except SessionPasswordNeededError:
-        logger.error("❌ نیاز به رمز عبور دو مرحله‌ای!")
+        pub.error("2fa required")
 
     except Exception as e:
-        logger.error(f"❌ خطای کلی: {type(e).__name__}: {e}")
+        # فقط نوع خطا؛ متن خطا ممکنه URL کامل (با داده‌ی احراز هویت) داشته باشه
+        pub.error(f"error: {type(e).__name__}")
 
     finally:
         if success and (online_ok or not RETRY_IF_OFFLINE):
             schedule_next_run()
         elif success:
-            logger.warning("⚠️ موقع خروج ONLINE نبود؛ اجرای بعدی زودتر زمان‌بندی می‌شه")
-            schedule_retry('offline_retry')
+            pub.info("exit status not ok; retrying sooner")
+            schedule_retry('retry-status')
         else:
             schedule_retry()
 
@@ -892,7 +1031,7 @@ async def run_bot():
         except Exception:
             pass
         await client.disconnect()
-        logger.info("✅ قطع اتصال")
+        pub.info("job end")
 
 
 if __name__ == "__main__":
